@@ -29,7 +29,7 @@ def probe_npu() -> NpuStatus:
 
     hw = probe.check_hardware()
     drv = probe.check_driver()
-    backend = os.environ.get("NPU_RUNTIME", "auto")
+    backend = os.environ.get("NPU_RUNTIME", "xrt")
 
     if not hw.ok:
         return NpuStatus(

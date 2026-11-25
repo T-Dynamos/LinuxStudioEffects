@@ -1,0 +1,144 @@
+name: Build XRT NPU runtime bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      xdna_ref:
+        description: AMD XDNA driver commit or ref to build
+        type: string
+        required: false
+        default: 31c01f2019e79e13603239478dad8291a27897a5
+
+permissions:
+  contents: read
+
+jobs:
+  build-bundle:
+    name: Build from source and package plain tar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      XDNA_SRC: ${{ runner.temp }}/xdna-driver
+      BUNDLE_NAME: ryzen-ai-xrt-npu1-linux-x86_64
+      BUNDLE_ROOT: ${{ runner.temp }}/ryzen-ai-xrt-npu1-linux-x86_64
+      XRT_PREFIX: ${{ runner.temp }}/ryzen-ai-xrt-npu1-linux-x86_64/xrt
+    steps:
+      - name: Clone AMD XDNA driver and XRT sources
+        env:
+          XDNA_REF: ${{ inputs.xdna_ref }}
+        run: |
+          git clone https://github.com/amd/xdna-driver.git "$XDNA_SRC"
+          git -C "$XDNA_SRC" checkout "$XDNA_REF"
+          git -C "$XDNA_SRC" submodule update --init --recursive
+
+      - name: Install source build dependencies
+        run: sudo bash "$XDNA_SRC/tools/amdxdna_deps.sh"
+
+      - name: Configure and build XRT userspace
+        run: |
+          python3 - "$XDNA_SRC/xrt/src/CMake/nativeLnx.cmake" <<'PY'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          marker = "# --- PkgConfig ---"
+          fix = 'set(PKG_CONFIG_EXECUTABLE "/usr/bin/pkg-config" CACHE FILEPATH "Path to pkg-config executable")'
+          if fix not in text:
+              if marker not in text:
+                  raise SystemExit(f"Cannot find {marker!r} in {path}")
+              path.write_text(text.replace(marker, marker + "\n" + fix, 1))
+          PY
+          cd "$XDNA_SRC/xrt/build"
+          CXXFLAGS="-D_GLIBCXX_USE_CXX11_ABI=1 ${CXXFLAGS:-}" \
+            ./build.sh -npu -opt -noctest -noinit -j 16 -install_prefix "$XRT_PREFIX"
+          xrt_stage="$XDNA_SRC/xrt/build/Release$XRT_PREFIX"
+          test -x "$xrt_stage/bin/xrt-smi"
+          mkdir -p "$XRT_PREFIX"
+          cp -a "$xrt_stage/." "$XRT_PREFIX/"
+
+      - name: Build AMD XDNA userspace plugin
+        run: |
+          cd "$XDNA_SRC/build"
+          PKG_CONFIG_PATH="$XRT_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+            ./build.sh -release -nokmod -j 16 -install_prefix "$XRT_PREFIX"
+          plugin_stage="$XDNA_SRC/build/Release$XRT_PREFIX"
+          test -f "$plugin_stage/lib/libxrt_driver_xdna.so.2"
+          cp -a "$plugin_stage/." "$XRT_PREFIX/"
+
+      - name: Assemble relocatable bundle and plain tar
+        run: |
+          mkdir -p "$BUNDLE_ROOT/LICENSES" "$XRT_PREFIX/lib"
+          for elf in "$XRT_PREFIX/bin/unwrapped"/* "$XRT_PREFIX/lib"/*.so*; do
+            [[ -f "$elf" ]] || continue
+            while IFS= read -r library; do
+              [[ -f "$library" ]] && cp -L -- "$library" "$XRT_PREFIX/lib/"
+            done < <(LD_LIBRARY_PATH="$XRT_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+              ldd "$elf" 2>/dev/null | awk '$1 ~ /^libboost_/ && $2 == "=>" && $3 ~ /^\// {print $3}')
+          done
+
+          cp "$XDNA_SRC/xrt/LICENSE" "$BUNDLE_ROOT/LICENSES/XRT-LICENSE"
+          cp "$XDNA_SRC/LICENSE.amdnpu" "$BUNDLE_ROOT/LICENSES/AMD-XDNA-PLUGIN-LICENSE"
+          cp "$XDNA_SRC/src/vxdna/LICENSE" "$BUNDLE_ROOT/LICENSES/vxdna-LICENSE"
+          boost_copyright="$(find /usr/share/doc -type f -path '*boost*' -name copyright -print -quit 2>/dev/null || true)"
+          if [[ -n "$boost_copyright" ]]; then
+            cp "$boost_copyright" "$BUNDLE_ROOT/LICENSES/Boost-copyright"
+          fi
+
+          cat > "$BUNDLE_ROOT/run-xrt-smi" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          BUNDLE_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          source "$BUNDLE_ROOT/xrt/setup.sh"
+          exec "$BUNDLE_ROOT/xrt/bin/xrt-smi" "$@"
+          SH
+          chmod 755 "$BUNDLE_ROOT/run-xrt-smi"
+
+          cat > "$BUNDLE_ROOT/README.md" <<'MD'
+          # Source-built XRT + AMD XDNA userspace bundle
+
+          This relocatable x86_64 Linux bundle contains XRT, `xrt-smi`, and the
+          matching AMD XDNA userspace plugin. Extract the plain tar and run:
+
+          ```bash
+          tar -xf ryzen-ai-xrt-npu1-linux-x86_64.tar
+          cd ryzen-ai-xrt-npu1-linux-x86_64
+          ./run-xrt-smi examine
+          ```
+
+          Requires a compatible x86_64 Linux/glibc system, an `amdxdna` kernel
+          driver and firmware suitable for the target kernel/NPU, and access to
+          the NPU device nodes. The kernel module, firmware, ONNX Runtime, model,
+          and MLIR-AIE compiler are not included. Python bindings match the
+          Python version used by the Ubuntu 24.04 build runner.
+          MD
+
+          cat > "$BUNDLE_ROOT/BUILD-METADATA.txt" <<EOF
+          Bundle: $BUNDLE_NAME
+          Target architecture: x86_64
+          Build OS: $(. /etc/os-release && echo "$PRETTY_NAME")
+          Build glibc: $(ldd --version | head -n1)
+          Build compiler: $(c++ --version | head -n1)
+          XRT source commit: $(git -C "$XDNA_SRC/xrt" rev-parse HEAD)
+          XDNA source commit: $(git -C "$XDNA_SRC" rev-parse HEAD)
+          XRT options: -npu -opt -noctest -noinit
+          XDNA options: -release -nokmod
+          EOF
+
+          (
+            cd "$BUNDLE_ROOT"
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          tar --format=posix --owner=0 --group=0 --numeric-owner \
+            -cf "$RUNNER_TEMP/$BUNDLE_NAME.tar" -C "$RUNNER_TEMP" "$BUNDLE_NAME"
+          sha256sum "$RUNNER_TEMP/$BUNDLE_NAME.tar" > "$RUNNER_TEMP/$BUNDLE_NAME.tar.sha256"
+
+      - name: Upload plain tar bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ryzen-ai-xrt-npu1-linux-x86_64
+          path: |
+            ${{ runner.temp }}/ryzen-ai-xrt-npu1-linux-x86_64.tar
+            ${{ runner.temp }}/ryzen-ai-xrt-npu1-linux-x86_64.tar.sha256
+          if-no-files-found: error
+          retention-days: 14

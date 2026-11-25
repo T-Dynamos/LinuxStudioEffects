@@ -9,12 +9,12 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from linux_studio_effects.video import (
-    GreyscaleEffect,
     PipelineConfig,
     PipelineStats,
     VideoPipeline,
     pick_default_loopback,
 )
+from linux_studio_effects.video.effects.greyscale.npu import GreyscaleEffect
 
 
 def _parse_size(text: str) -> tuple[int, int]:

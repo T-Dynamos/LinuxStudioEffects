@@ -13,22 +13,20 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 from linux_studio_effects.video import (
     BUILTIN_EFFECTS,
     ComputeDevice,
-    EffectChain,
     FrameContext,
     FrameEffect,
-    MirrorEffect,
+    FrameGraph,
     PipelineConfig,
     PipelineStats,
-    SpotlightEffect,
     VideoPipeline,
     pick_default_loopback,
 )
+from linux_studio_effects.video.effects.mirror.cpu import MirrorEffect
+from linux_studio_effects.video.effects.spotlight.cpu import SpotlightEffect
 
 
 class WarmTintEffect(FrameEffect):
     """Example custom FrameEffect showing setup/process/teardown with device selection."""
-
-    supported_devices = (ComputeDevice.CPU,)
 
     def __init__(self, warmth: float = 0.12, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
@@ -70,25 +68,23 @@ def _parse_size(text: str) -> tuple[int, int]:
 
 def _build_effect(preset: str, device: str) -> FrameEffect:
     if preset == "studio_demo":
-        return EffectChain(
-            [
-                MirrorEffect(device=device),
-                SpotlightEffect(edge_dim=0.45, device=device),
-                WarmTintEffect(warmth=0.10, device=device),
-                simple_border_overlay,
-            ],
-            name="StudioDemoChain",
-        )
+        graph = FrameGraph(name="StudioDemoGraph")
+        graph.add("mirror", MirrorEffect(device=device))
+        graph.add("spotlight", SpotlightEffect(edge_dim=0.45, device=device), source="mirror")
+        graph.add("warm_tint", WarmTintEffect(warmth=0.10, device=device), source="spotlight")
+        graph.add("border", simple_border_overlay, source="warm_tint")
+        graph.set_output("border")
+        return graph
     return BUILTIN_EFFECTS[preset]()
 
 
 def main() -> int:
     choices = (*BUILTIN_EFFECTS.keys(), "studio_demo")
     parser = argparse.ArgumentParser(
-        description="Run a frame-in -> frame-out effect chain into v4l2loopback until Ctrl+C."
+        description="Run a composable frame graph into v4l2loopback until Ctrl+C."
     )
     parser.add_argument("--effect", choices=choices, default="studio_demo", help="Effect preset (default: studio_demo)")
-    parser.add_argument("--device", choices=("auto", "cpu", "npu", "gpu"), default="auto", help="Compute backend")
+    parser.add_argument("--device", choices=("auto", "cpu"), default="auto", help="Compute backend for CPU-only demo effects")
     parser.add_argument("--in-size", type=_parse_size, default=(1280, 720))
     parser.add_argument("--out-size", type=_parse_size, default=(1280, 720))
     parser.add_argument("--fps", type=float, default=30.0)

@@ -128,7 +128,7 @@ def _build_greyscale_kernel(total_bytes: int, num_workers: int, tile_pixels: int
 class GreyscaleEffect(FrameEffect):
     """Convert RGB video frames to BT.601 greyscale RGB on the AMD Ryzen AI NPU."""
 
-    supported_devices = (ComputeDevice.NPU,)
+    effect_name = "greyscale"
 
     def __init__(self, *, name: str | None = None, device: ComputeDevice | str = ComputeDevice.NPU, enabled: bool = True) -> None:
         super().__init__(name=name, device=device, enabled=enabled)

@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""Self-contained IRON / MLIR-AIE setup and NPU verification script.
-
-Provisions an isolated Python virtual environment (``ironenv``) using the
-standalone HRX runtime (``libhrx.so``) and bundled ``hrx-xclbinutil`` so NPU
-code runs directly against ``/dev/accel/accel*`` without system XRT or
-``xrt-plugin-amdxdna`` packages.
-"""
+"""Self-contained IRON / MLIR-AIE setup with a bundled standalone XRT runtime."""
 
 from __future__ import annotations
 
 import argparse
 import glob
 import hashlib
-import importlib.metadata
-import json
 import os
 import pathlib
 import platform
@@ -28,12 +20,13 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
-SUPPORTED_PY_MINORS = (14, 13, 12, 11)
+SUPPORTED_PY_MINORS = (14,)
 MLIR_AIE_REPO = "https://github.com/Xilinx/mlir-aie.git"
 MLIR_AIE_LATEST_WHEELS = "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-5"
 MLIR_AIE_RELEASE_URL = "https://github.com/Xilinx/mlir-aie/releases"
 LLVM_AIE_NIGHTLY = "https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly"
-HRX_RELEASES_URL = "https://github.com/jtuyls/hrx/releases"
+XRT_BUNDLE_DEFAULT = pathlib.Path("/home/tdynamos/amdnpu/dist/ryzen-ai-xrt-npu1-linux-x86_64.tar")
+XRT_BUNDLE_NAME = "ryzen-ai-xrt-npu1-linux-x86_64"
 
 ACTIVATE_MARKER_START = "# >>> ironenv-npu >>>"
 ACTIVATE_MARKER_END = "# <<< ironenv-npu <<<"
@@ -49,10 +42,6 @@ class PreflightResult:
     npu2: int
     python_spec: str
     use_uv: bool
-    has_cmake: bool
-    cc_bin: str
-    cxx_bin: str
-    zstd_mode: str
 
 
 def log(msg: str) -> None:
@@ -128,7 +117,7 @@ def read_sysfs_attr(device_dir: pathlib.Path, name: str) -> str:
 
 
 def find_compatible_python() -> str | None:
-    """Locate a host Python 3.11-3.14 executable."""
+    """Locate CPython 3.14, which matches the XRT bundle's pyxrt binding."""
     cur_major, cur_minor = sys.version_info[:2]
     if cur_major == 3 and cur_minor in SUPPORTED_PY_MINORS:
         return sys.executable
@@ -147,28 +136,6 @@ def find_compatible_python() -> str | None:
             if out == f"3.{minor}":
                 return found
     return None
-
-
-def detect_zstd_mode() -> str | None:
-    """Determine how to unpack .tar.zst archives without extra packages."""
-    try:
-        subprocess.run(
-            ["tar", "--zstd", "--version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        return "tar_zstd"
-    except (OSError, subprocess.SubprocessError):
-        pass
-    if shutil.which("zstd"):
-        return "zstd_pipe"
-    try:
-        import compression.zstd  # noqa: F401  # Python 3.14+ stdlib
-
-        return "py_zstd"
-    except ImportError:
-        return None
 
 
 def preflight_checks(*, test_only: bool) -> PreflightResult:
@@ -235,11 +202,11 @@ def preflight_checks(*, test_only: bool) -> PreflightResult:
         py_ver = subprocess.check_output([py_bin, "-c", "import sys; print(sys.version.split()[0])"], text=True).strip()
         print(f"  [OK]   Python: {py_ver} at {py_bin}" + (" (uv available)" if use_uv else ""))
     elif use_uv:
-        python_spec = "3.13"
-        print("  [OK]   Python: no system 3.11-3.14 found; uv will provision 3.13")
+        python_spec = "3.14"
+        print("  [OK]   Python: no system Python 3.14 found; uv will provision 3.14")
     else:
-        print("  [FAIL] Python: need Python 3.11-3.14 or 'uv'")
-        die("Install Python 3.11-3.14 or 'uv' (https://docs.astral.sh/uv/).")
+        print("  [FAIL] Python: need Python 3.14 or 'uv'")
+        die("Install Python 3.14 or 'uv' (https://docs.astral.sh/uv/).")
 
     if test_only:
         return PreflightResult(
@@ -249,30 +216,12 @@ def preflight_checks(*, test_only: bool) -> PreflightResult:
             npu2=npu2,
             python_spec=python_spec,
             use_uv=use_uv,
-            has_cmake=False,
-            cc_bin="",
-            cxx_bin="",
-            zstd_mode="",
         )
 
     if not shutil.which("git"):
         print("  [FAIL] Tool: 'git' not found")
         die("'git' is required to clone Xilinx/mlir-aie.")
     print(f"  [OK]   Git: {shutil.which('git')}")
-
-    cc_bin = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang") or ""
-    cxx_bin = shutil.which("c++") or shutil.which("g++") or shutil.which("clang++") or ""
-    has_cmake = shutil.which("cmake") is not None
-    if not (cc_bin and cxx_bin):
-        print("  [FAIL] Compiler: C/C++ compiler not found (needed to build hrx-xclbinutil)")
-        die("Install gcc/g++ or clang/clang++ to compile standalone hrx-xclbinutil.")
-    print(f"  [OK]   Compiler: {cxx_bin}" + (" (+ cmake)" if has_cmake else " (direct build, no cmake)"))
-
-    zstd_mode = detect_zstd_mode() or ""
-    if not zstd_mode:
-        print("  [FAIL] Archive: neither 'tar --zstd', 'zstd', nor Python 3.14 zstd available")
-        die("Install 'zstd' (or tar with zstd support) to unpack libhrx.")
-    print(f"  [OK]   Zstd unpacker: {zstd_mode}")
 
     return PreflightResult(
         accel_nodes=rw_nodes,
@@ -281,10 +230,6 @@ def preflight_checks(*, test_only: bool) -> PreflightResult:
         npu2=npu2,
         python_spec=python_spec,
         use_uv=use_uv,
-        has_cmake=has_cmake,
-        cc_bin=cc_bin,
-        cxx_bin=cxx_bin,
-        zstd_mode=zstd_mode,
     )
 
 
@@ -367,226 +312,163 @@ def install_python_toolchain(
         pip_install(venv_dir, preflight, ["-U", "-r", str(mlir_aie_dir / "utils" / "peano-requirements.txt")])
 
 
-def parse_env_file(path: pathlib.Path) -> dict[str, str]:
-    """Parse simple KEY="VALUE" lines from utils/hrx-release.env."""
-    values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        values[k.strip()] = v.strip().strip('"').strip("'")
-    return values
+def sha256_file(path: pathlib.Path) -> str:
+    """Hash a large runtime archive without reading it all into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def resolve_hrx_asset(mlir_aie_dir: pathlib.Path, *, channel: str) -> tuple[str, str, str | None]:
-    """Return (asset_name, asset_url, expected_sha256_or_none)."""
-    if channel == "latest":
-        try:
-            html = fetch_bytes(HRX_RELEASES_URL).decode("utf-8", errors="replace")
-            m = re.search(r"/jtuyls/hrx/releases/tag/(flm-hrx-amdxdna-v[^\"<> /]+)", html)
-            if m:
-                tag = m.group(1)
-                assets_html = fetch_bytes(f"{HRX_RELEASES_URL}/expanded_assets/{tag}").decode(
-                    "utf-8", errors="replace"
+def read_sha256(path: pathlib.Path) -> str | None:
+    """Read the first SHA-256 token from a conventional .sha256 sidecar."""
+    sidecar = pathlib.Path(f"{path}.sha256")
+    if not sidecar.is_file():
+        return None
+    parts = sidecar.read_text(encoding="utf-8").strip().split()
+    return parts[0].lower() if parts else None
+
+
+def install_xrt_runtime(venv_dir: pathlib.Path, bundle_source: str | pathlib.Path) -> pathlib.Path:
+    """Verify and unpack the standalone XRT + AMD XDNA bundle into the venv."""
+    source_text = str(bundle_source)
+    is_url = source_text.startswith(("https://", "http://"))
+    xrt_dir = venv_dir / "xrt"
+
+    with tempfile.TemporaryDirectory() as temporary:
+        temp_dir = pathlib.Path(temporary)
+        if is_url:
+            archive = temp_dir / f"{XRT_BUNDLE_NAME}.tar"
+            log(f"Downloading standalone XRT bundle from {source_text}")
+            fetch_to_file(source_text, archive, timeout=180)
+            try:
+                sidecar = fetch_bytes(f"{source_text}.sha256", timeout=30).decode("utf-8", errors="replace")
+                expected_sha = sidecar.strip().split()[0].lower()
+            except (urllib.error.URLError, OSError, IndexError):
+                die("XRT bundle URL must have a matching .sha256 sidecar")
+        else:
+            archive = pathlib.Path(source_text).expanduser().resolve()
+            if not archive.is_file():
+                die(
+                    f"XRT bundle not found at {archive}. Put the bundle there or pass "
+                    "--xrt-bundle PATH_OR_URL."
                 )
-                am = re.search(r"(hrx-[^\"<> /]+linux-x86_64\.tar\.zst)", assets_html)
-                if am:
-                    asset_name = am.group(1)
-                    asset_url = f"{HRX_RELEASES_URL}/download/{tag}/{asset_name}"
-                    expected_sha = None
-                    if f"{asset_name}.sha256" in assets_html:
-                        sha_txt = fetch_bytes(f"{asset_url}.sha256").decode("utf-8", errors="replace")
-                        expected_sha = sha_txt.strip().split()[0]
-                    return asset_name, asset_url, expected_sha
-        except (urllib.error.URLError, OSError, IndexError) as exc:
-            warn(f"Could not query latest HRX release ({exc}); falling back to mlir-aie pinned release.")
-
-    pinned = parse_env_file(mlir_aie_dir / "utils" / "hrx-release.env")
-    repo = pinned["HRX_RELEASE_REPO"]
-    tag = pinned["HRX_RELEASE_TAG"]
-    asset_name = pinned["HRX_RELEASE_ASSET"]
-    expected_sha = pinned.get("HRX_RELEASE_SHA256")
-    return asset_name, f"https://github.com/{repo}/releases/download/{tag}/{asset_name}", expected_sha
-
-
-def unpack_tar_zst(archive: pathlib.Path, dest_dir: pathlib.Path, zstd_mode: str) -> None:
-    """Unpack a .tar.zst archive into dest_dir stripping the top-level directory."""
-    if zstd_mode == "tar_zstd":
-        run(["tar", "--zstd", "-xf", str(archive), "-C", str(dest_dir), "--strip-components=1"])
-        return
-
-    if zstd_mode == "zstd_pipe":
-        p1 = subprocess.Popen(["zstd", "-dc", str(archive)], stdout=subprocess.PIPE)
-        try:
-            subprocess.run(
-                ["tar", "-xf", "-", "-C", str(dest_dir), "--strip-components=1"],
-                stdin=p1.stdout,
-                check=True,
-            )
-        finally:
-            if p1.stdout:
-                p1.stdout.close()
-            if p1.wait() != 0:
-                die("zstd decompression failed")
-        return
-
-    import io
-    from compression import zstd
-
-    raw = zstd.decompress(archive.read_bytes())
-    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tf:
-        members = []
-        for m in tf.getmembers():
-            parts = m.name.split("/", 1)
-            if len(parts) < 2 or not parts[1]:
-                continue
-            m.name = parts[1]
-            members.append(m)
-        tf.extractall(dest_dir, members=members)
-
-
-def install_hrx_runtime(
-    venv_dir: pathlib.Path,
-    mlir_aie_dir: pathlib.Path,
-    preflight: PreflightResult,
-    *,
-    channel: str,
-) -> pathlib.Path:
-    """Download, verify, and unpack libhrx directly inside venv_dir/hrx."""
-    asset_name, asset_url, expected_sha = resolve_hrx_asset(mlir_aie_dir, channel=channel)
-    hrx_dir = venv_dir / "hrx"
-
-    with tempfile.TemporaryDirectory() as tmp:
-        archive = pathlib.Path(tmp) / asset_name
-        log(f"Downloading HRX runtime: {asset_name}")
-        fetch_to_file(asset_url, archive)
+            expected_sha = read_sha256(archive)
 
         if expected_sha:
-            actual_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+            actual_sha = sha256_file(archive)
             if actual_sha != expected_sha:
-                die(f"HRX sha256 mismatch: got {actual_sha}, expected {expected_sha}")
-            log(f"HRX checksum verified ({actual_sha[:16]}...)")
+                die(f"XRT bundle sha256 mismatch: got {actual_sha}, expected {expected_sha}")
+            log(f"XRT bundle checksum verified ({actual_sha[:16]}...)")
+        else:
+            warn("XRT bundle has no .sha256 sidecar; archive integrity was not verified")
 
-        if hrx_dir.exists():
-            shutil.rmtree(hrx_dir)
-        hrx_dir.mkdir(parents=True, exist_ok=True)
-        unpack_tar_zst(archive, hrx_dir, preflight.zstd_mode)
+        extract_dir = temp_dir / "extracted"
+        extract_dir.mkdir()
+        try:
+            with tarfile.open(archive, mode="r:*") as tar:
+                tar.extractall(extract_dir, filter="data")
+        except (tarfile.TarError, OSError) as exc:
+            die(f"Could not extract XRT bundle: {exc}")
+        source_xrt = extract_dir / XRT_BUNDLE_NAME / "xrt"
+        required = (
+            source_xrt / "setup.sh",
+            source_xrt / "bin" / "xclbinutil",
+            source_xrt / "bin" / "xrt-smi",
+            source_xrt / "lib" / "libxrt_core.so",
+            source_xrt / "lib" / "libxrt_driver_xdna.so.2",
+        )
+        missing = [str(path.relative_to(source_xrt)) for path in required if not path.exists()]
+        if missing:
+            die(f"XRT bundle is missing required files: {', '.join(missing)}")
+        if not list((source_xrt / "python").glob("pyxrt*.so")):
+            die("XRT bundle does not contain its pyxrt Python binding")
 
-    if not (hrx_dir / "lib" / "libhrx.so").exists():
-        die(f"libhrx.so missing after extraction in {hrx_dir / 'lib'}")
-    log(f"Installed libhrx into {hrx_dir}")
-    return hrx_dir
+        if xrt_dir.exists():
+            shutil.rmtree(xrt_dir)
+        shutil.copytree(source_xrt, xrt_dir)
+
+    # Do not leave an old runtime available to mask a broken XRT configuration.
+    stale_hrx = venv_dir / "hrx"
+    if stale_hrx.exists():
+        shutil.rmtree(stale_hrx)
+
+    py_version = subprocess.check_output(
+        [str(venv_dir / "bin" / "python"), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+        text=True,
+    ).strip()
+    if py_version != "3.14":
+        die(f"Bundled pyxrt targets CPython 3.14, but the environment uses Python {py_version}")
+
+    env = os.environ.copy()
+    env["XILINX_XRT"] = str(xrt_dir)
+    env["XRT_ROOT"] = str(xrt_dir)
+    env["LD_LIBRARY_PATH"] = f"{xrt_dir / 'lib'}{os.pathsep}{env.get('LD_LIBRARY_PATH', '')}"
+    version = subprocess.run(
+        [str(xrt_dir / "bin" / "xclbinutil"), "--version"],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if version.returncode:
+        die(f"Bundled xclbinutil failed to start:\n{version.stdout}")
+    log(f"Installed standalone XRT runtime into {xrt_dir}")
+    log(f"Bundled xclbinutil: {version.stdout.strip().splitlines()[0]}")
+
+    # Confirm both the binary runtime and MLIR-AIE's selected Python backend
+    # are using this bundle before declaring installation successful.
+    binding_env = env.copy()
+    binding_env["NPU_RUNTIME"] = "xrt"
+    binding_env["PYTHONPATH"] = os.pathsep.join(
+        [str(xrt_dir / "python"), binding_env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    binding = subprocess.run(
+        [
+            str(venv_dir / "bin" / "python"),
+            "-c",
+            (
+                "import pyxrt; "
+                "from aie.utils.tensor_factory import _NPU_RUNTIME, DEFAULT_TENSOR_CLASS; "
+                "assert _NPU_RUNTIME == 'xrt', _NPU_RUNTIME; "
+                "assert DEFAULT_TENSOR_CLASS.__name__ == 'XRTTensor', DEFAULT_TENSOR_CLASS; "
+                "print('pyxrt:', pyxrt.__file__); "
+                "print('MLIR-AIE backend:', _NPU_RUNTIME, DEFAULT_TENSOR_CLASS.__name__)"
+            ),
+        ],
+        env=binding_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if binding.returncode:
+        die(f"Standalone XRT Python binding/backend check failed:\n{binding.stdout}")
+    for line in binding.stdout.splitlines():
+        log(line)
+    return xrt_dir
 
 
 def locate_venv_package_dir(venv_dir: pathlib.Path, dist_name: str, subdir: str) -> pathlib.Path:
-    """Resolve the installed package directory inside venv_dir without importing it."""
+    """Resolve an installed package directory inside the target venv."""
     code = (
         "import importlib.metadata as md, pathlib, sys; "
         "print(pathlib.Path(md.distribution(sys.argv[1]).locate_file(sys.argv[2])))"
     )
-    out = subprocess.check_output(
-        [str(venv_dir / "bin" / "python"), "-c", code, dist_name, subdir],
-        text=True,
-    ).strip()
-    path = pathlib.Path(out)
+    try:
+        output = subprocess.check_output(
+            [str(venv_dir / "bin" / "python"), "-c", code, dist_name, subdir],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        die(f"Could not locate installed distribution {dist_name!r}:\n{exc.output}")
+    path = pathlib.Path(output)
     if not path.exists():
-        die(f"Expected package directory not found: {path}")
+        die(f"Expected package directory not found for {dist_name!r}: {path}")
     return path
-
-
-def install_xclbinutil(
-    venv_dir: pathlib.Path,
-    mlir_aie_dir: pathlib.Path,
-    preflight: PreflightResult,
-) -> pathlib.Path:
-    """Build Boost-free, XRT-free hrx-xclbinutil and install it inside ironenv."""
-    src_dir = mlir_aie_dir / "third_party" / "hrx-xclbinutil"
-    if not src_dir.exists():
-        die(f"Missing hrx-xclbinutil sources at {src_dir}")
-
-    mlir_aie_pkg_dir = locate_venv_package_dir(venv_dir, "mlir_aie", "mlir_aie")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        build_dir = pathlib.Path(tmp)
-        if preflight.has_cmake:
-            log("Building standalone hrx-xclbinutil with cmake...")
-            run(["cmake", "-S", str(src_dir), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"], capture=True)
-            jobs = str(os.cpu_count() or 4)
-            run(["cmake", "--build", str(build_dir), f"-j{jobs}"], capture=True)
-            built_bin = build_dir / "tools" / "hrx-xclbinutil"
-        else:
-            log("Building standalone hrx-xclbinutil directly with C/C++ compiler...")
-            gen_dir = build_dir / "gen"
-            obj_dir = build_dir / "obj"
-            gen_dir.mkdir(parents=True, exist_ok=True)
-            obj_dir.mkdir(parents=True, exist_ok=True)
-
-            ver_tpl = (src_dir / "vendor" / "version.h.in").read_text(encoding="utf-8")
-            replacements = {
-                "@XRT_VERSION_STRING@": "2.18.0",
-                "@XRT_HEAD_COMMITS@": "0xDEADBEEF",
-                "@XRT_BRANCH_COMMITS@": "0xDEADFACE",
-                "@XRT_BRANCH@": "mlir-aie-hrx",
-                "@XRT_HASH@": "",
-                "@XRT_HASH_DATE@": "",
-                "@XRT_DATE_RFC@": "",
-                "@XRT_DATE@": "",
-                "@XRT_MODIFIED_FILES@": "",
-            }
-            for k, v in replacements.items():
-                ver_tpl = ver_tpl.replace(k, v)
-            (gen_dir / "version.h").write_text(ver_tpl, encoding="utf-8")
-
-            pdi_root = src_dir / "vendor" / "xclbinutil" / "aie-pdi-transform"
-            pdi_objs: list[str] = []
-            for c_file in sorted([*(pdi_root / "src").glob("*.c"), *(pdi_root / "lib").glob("*.c")]):
-                obj = str(obj_dir / f"{c_file.stem}.o")
-                run(
-                    [
-                        preflight.cc_bin,
-                        "-O2",
-                        "-c",
-                        f"-I{pdi_root / 'include'}",
-                        f"-I{pdi_root / 'lib'}",
-                        str(c_file),
-                        "-o",
-                        obj,
-                    ]
-                )
-                pdi_objs.append(obj)
-
-            cxx_srcs = sorted(str(p) for p in (src_dir / "vendor" / "xclbinutil").glob("*.cxx"))
-            built_bin = build_dir / "xclbinutil"
-            run(
-                [
-                    preflight.cxx_bin,
-                    "-O2",
-                    "-std=c++17",
-                    "-fexceptions",
-                    "-frtti",
-                    "-w",
-                    "-pthread",
-                    f"-I{gen_dir}",
-                    f"-I{src_dir / 'util'}",
-                    f"-I{src_dir / 'vendor' / 'include'}",
-                    f"-I{src_dir / 'vendor' / 'xclbinutil'}",
-                    f"-I{pdi_root / 'include'}",
-                    *cxx_srcs,
-                    str(src_dir / "util" / "hrx_util.cpp"),
-                    *pdi_objs,
-                    "-o",
-                    str(built_bin),
-                ]
-            )
-
-        for target in (venv_dir / "bin" / "xclbinutil", mlir_aie_pkg_dir / "bin" / "xclbinutil"):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(built_bin, target)
-            target.chmod(0o755)
-
-    log(f"Installed standalone xclbinutil to {venv_dir / 'bin' / 'xclbinutil'}")
-    return venv_dir / "bin" / "xclbinutil"
 
 
 def _upsert_hook(path: pathlib.Path, hook_body: str) -> None:
@@ -604,7 +486,7 @@ def _upsert_hook(path: pathlib.Path, hook_body: str) -> None:
 
 
 def write_env_integration(venv_dir: pathlib.Path, preflight: PreflightResult) -> None:
-    """Configure bash/zsh, fish, and Python .pth runtime wiring inside ironenv."""
+    """Wire the bundled XRT libraries and pyxrt into shell and direct Python runs."""
     mlir_aie_pkg_dir = locate_venv_package_dir(venv_dir, "mlir_aie", "mlir_aie")
     peano_pkg_dir = locate_venv_package_dir(venv_dir, "llvm-aie", "llvm-aie")
     purelib = pathlib.Path(
@@ -613,6 +495,7 @@ def write_env_integration(venv_dir: pathlib.Path, preflight: PreflightResult) ->
             text=True,
         ).strip()
     )
+    xrt_dir = venv_dir / "xrt"
 
     iron_env_sh = venv_dir / "iron_env.sh"
     iron_env_sh.write_text(
@@ -620,15 +503,14 @@ def write_env_integration(venv_dir: pathlib.Path, preflight: PreflightResult) ->
 _ironenv_root="{venv_dir}"
 export MLIR_AIE_INSTALL_DIR="{mlir_aie_pkg_dir}"
 export PEANO_INSTALL_DIR="{peano_pkg_dir}"
-export HRX_DIR="${{_ironenv_root}}/hrx"
-export LIBHRX_DIR="${{HRX_DIR}}/lib"
-export HRX_LIBHRX="${{LIBHRX_DIR}}/libhrx.so"
-export NPU_RUNTIME="hrx"
+export XRT_ROOT="${{_ironenv_root}}/xrt"
+export XILINX_XRT="${{XRT_ROOT}}"
+export NPU_RUNTIME="xrt"
 export NPU2="{preflight.npu2}"
-export AIE_XCLBINUTIL="${{_ironenv_root}}/bin/xclbinutil"
-export PATH="${{MLIR_AIE_INSTALL_DIR}}/bin:${{_ironenv_root}}/bin:${{PATH}}"
-export PYTHONPATH="${{MLIR_AIE_INSTALL_DIR}}/python${{PYTHONPATH:+:${{PYTHONPATH}}}}"
-export LD_LIBRARY_PATH="${{LIBHRX_DIR}}:${{MLIR_AIE_INSTALL_DIR}}/lib${{LD_LIBRARY_PATH:+:${{LD_LIBRARY_PATH}}}}"
+export AIE_XCLBINUTIL="${{XRT_ROOT}}/bin/xclbinutil"
+export PATH="${{MLIR_AIE_INSTALL_DIR}}/bin:${{_ironenv_root}}/bin:${{XRT_ROOT}}/bin:${{PATH}}"
+export PYTHONPATH="${{XRT_ROOT}}/python:${{MLIR_AIE_INSTALL_DIR}}/python${{PYTHONPATH:+:${{PYTHONPATH}}}}"
+export LD_LIBRARY_PATH="${{XRT_ROOT}}/lib:${{MLIR_AIE_INSTALL_DIR}}/lib${{LD_LIBRARY_PATH:+:${{LD_LIBRARY_PATH}}}}"
 unset _ironenv_root
 """,
         encoding="utf-8",
@@ -640,22 +522,21 @@ unset _ironenv_root
 set -l _ironenv_root "{venv_dir}"
 set -gx MLIR_AIE_INSTALL_DIR "{mlir_aie_pkg_dir}"
 set -gx PEANO_INSTALL_DIR "{peano_pkg_dir}"
-set -gx HRX_DIR "$_ironenv_root/hrx"
-set -gx LIBHRX_DIR "$HRX_DIR/lib"
-set -gx HRX_LIBHRX "$LIBHRX_DIR/libhrx.so"
-set -gx NPU_RUNTIME "hrx"
+set -gx XRT_ROOT "$_ironenv_root/xrt"
+set -gx XILINX_XRT "$XRT_ROOT"
+set -gx NPU_RUNTIME "xrt"
 set -gx NPU2 "{preflight.npu2}"
-set -gx AIE_XCLBINUTIL "$_ironenv_root/bin/xclbinutil"
-set -gx PATH "$MLIR_AIE_INSTALL_DIR/bin" "$_ironenv_root/bin" $PATH
+set -gx AIE_XCLBINUTIL "$XRT_ROOT/bin/xclbinutil"
+set -gx PATH "$MLIR_AIE_INSTALL_DIR/bin" "$_ironenv_root/bin" "$XRT_ROOT/bin" $PATH
 if set -q PYTHONPATH
-    set -gx PYTHONPATH "$MLIR_AIE_INSTALL_DIR/python" $PYTHONPATH
+    set -gx PYTHONPATH "$XRT_ROOT/python" "$MLIR_AIE_INSTALL_DIR/python" $PYTHONPATH
 else
-    set -gx PYTHONPATH "$MLIR_AIE_INSTALL_DIR/python"
+    set -gx PYTHONPATH "$XRT_ROOT/python" "$MLIR_AIE_INSTALL_DIR/python"
 end
 if set -q LD_LIBRARY_PATH
-    set -gx LD_LIBRARY_PATH "$LIBHRX_DIR" "$MLIR_AIE_INSTALL_DIR/lib" $LD_LIBRARY_PATH
+    set -gx LD_LIBRARY_PATH "$XRT_ROOT/lib" "$MLIR_AIE_INSTALL_DIR/lib" $LD_LIBRARY_PATH
 else
-    set -gx LD_LIBRARY_PATH "$LIBHRX_DIR" "$MLIR_AIE_INSTALL_DIR/lib"
+    set -gx LD_LIBRARY_PATH "$XRT_ROOT/lib" "$MLIR_AIE_INSTALL_DIR/lib"
 end
 """,
         encoding="utf-8",
@@ -670,7 +551,7 @@ end
         'if test -f "$VIRTUAL_ENV/iron_env.fish"\n    source "$VIRTUAL_ENV/iron_env.fish"\nend',
     )
 
-    # Python startup hook (.pth) so any shell (zsh/nu/csh) or direct venv python invocation works.
+    # A .pth startup hook also supports direct venv Python use without activation.
     runtime_hook = purelib / "_ironenv_runtime.py"
     runtime_hook.write_text(
         f"""# Auto-generated by setup_ironenv.py
@@ -680,34 +561,36 @@ import sys
 _VENV_ROOT = {str(venv_dir)!r}
 _MLIR_AIE = {str(mlir_aie_pkg_dir)!r}
 _PEANO = {str(peano_pkg_dir)!r}
-_HRX_DIR = os.path.join(_VENV_ROOT, "hrx")
-_LIBHRX_DIR = os.path.join(_HRX_DIR, "lib")
+_XRT_ROOT = os.path.join(_VENV_ROOT, "xrt")
 _MLIR_PY = os.path.join(_MLIR_AIE, "python")
+_XRT_PY = os.path.join(_XRT_ROOT, "python")
 
-os.environ.setdefault("MLIR_AIE_INSTALL_DIR", _MLIR_AIE)
-os.environ.setdefault("PEANO_INSTALL_DIR", _PEANO)
-os.environ.setdefault("HRX_DIR", _HRX_DIR)
-os.environ.setdefault("LIBHRX_DIR", _LIBHRX_DIR)
-os.environ.setdefault("HRX_LIBHRX", os.path.join(_LIBHRX_DIR, "libhrx.so"))
-os.environ.setdefault("NPU_RUNTIME", "hrx")
-os.environ.setdefault("NPU2", {str(preflight.npu2)!r})
-os.environ.setdefault("AIE_XCLBINUTIL", os.path.join(_VENV_ROOT, "bin", "xclbinutil"))
+os.environ["MLIR_AIE_INSTALL_DIR"] = _MLIR_AIE
+os.environ["PEANO_INSTALL_DIR"] = _PEANO
+os.environ["XRT_ROOT"] = _XRT_ROOT
+os.environ["XILINX_XRT"] = _XRT_ROOT
+os.environ["NPU_RUNTIME"] = "xrt"
+os.environ["NPU2"] = {str(preflight.npu2)!r}
+os.environ["AIE_XCLBINUTIL"] = os.path.join(_XRT_ROOT, "bin", "xclbinutil")
 
-_bin_dirs = [os.path.join(_MLIR_AIE, "bin"), os.path.join(_VENV_ROOT, "bin")]
+_bin_dirs = [os.path.join(_MLIR_AIE, "bin"), os.path.join(_VENV_ROOT, "bin"), os.path.join(_XRT_ROOT, "bin")]
 _cur_path = os.environ.get("PATH", "").split(os.pathsep) if os.environ.get("PATH") else []
 os.environ["PATH"] = os.pathsep.join([d for d in _bin_dirs if d not in _cur_path] + _cur_path)
-
-if _MLIR_PY not in sys.path:
-    sys.path.insert(0, _MLIR_PY)
+_lib_dirs = [os.path.join(_XRT_ROOT, "lib"), os.path.join(_MLIR_AIE, "lib")]
+_cur_libs = os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if os.environ.get("LD_LIBRARY_PATH") else []
+os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([d for d in _lib_dirs if d not in _cur_libs] + _cur_libs)
+for _python_dir in (_XRT_PY, _MLIR_PY):
+    if _python_dir not in sys.path:
+        sys.path.insert(0, _python_dir)
 """,
         encoding="utf-8",
     )
     (purelib / "ironenv_npu.pth").write_text("import _ironenv_runtime\n", encoding="utf-8")
-    log(f"Wired bash, fish, and Python .pth runtime hooks inside {venv_dir}")
+    log(f"Wired bash, fish, and Python startup hooks for bundled XRT in {venv_dir}")
 
 
 def run_npu_tests(venv_dir: pathlib.Path, mlir_aie_dir: pathlib.Path) -> None:
-    """Verify JIT compilation and NPU hardware execution inside a clean env."""
+    """Verify XRT tensor allocation and NPU kernel execution inside a clean env."""
     log("Running NPU hardware verification tests in isolated environment...")
     with tempfile.TemporaryDirectory() as cache_dir:
         clean_env = {
@@ -726,7 +609,7 @@ def run_npu_tests(venv_dir: pathlib.Path, mlir_aie_dir: pathlib.Path) -> None:
                     "import aie.iron as iron, numpy as np; "
                     "dev = iron.ensure_current_device(); "
                     "t = iron.arange(1, 17, dtype=np.int32, device='npu'); "
-                    "assert type(t).__name__ == 'HRXTensor', type(t); "
+                    "assert type(t).__name__ == 'XRTTensor', type(t); "
                     "print('[test] Direct python (no activate):', dev, type(t).__name__)"
                 ),
             ],
@@ -740,7 +623,7 @@ source "{venv_dir / 'bin' / 'activate'}"
 
 echo "[test] python: $(which python3) ($(python3 -c 'import sys; print(sys.version.split()[0])'))"
 echo "[test] xclbinutil: $(which xclbinutil)"
-echo "[test] NPU_RUNTIME=${{NPU_RUNTIME}} NPU2=${{NPU2}} HRX_LIBHRX=${{HRX_LIBHRX}}"
+echo "[test] NPU_RUNTIME=${{NPU_RUNTIME}} NPU2=${{NPU2}} XRT_ROOT=${{XRT_ROOT}}"
 
 echo "[test] Running vector_scalar_add (fresh JIT compile + NPU run)..."
 python3 "{mlir_aie_dir / 'programming_examples' / 'basic' / 'vector_scalar_add' / 'vector_scalar_add.py'}" --problem-size 2048
@@ -756,7 +639,7 @@ python3 "{mlir_aie_dir / 'programming_examples' / 'basic' / 'vector_vector_add' 
                 f'source "{venv_dir / "bin" / "activate.fish"}"; '
                 f'python3 -c "import aie.iron as iron, numpy as np; '
                 f't = iron.zeros(8, dtype=np.int32, device=\'npu\'); '
-                f'assert type(t).__name__ == \'HRXTensor\'; '
+                f'assert type(t).__name__ == \'XRTTensor\'; '
                 f'print(\'[test] Fish activate.fish:\', iron.ensure_current_device(), type(t).__name__)"'
             )
             run(["fish", "-c", fish_cmd], env=clean_env)
@@ -779,7 +662,12 @@ def parse_args() -> argparse.Namespace:
         "--channel",
         choices=("latest", "release"),
         default="latest",
-        help="Install rolling latest wheels/HRX ('latest') or latest stable release ('release')",
+        help="Install rolling latest MLIR-AIE wheels ('latest') or latest stable release ('release')",
+    )
+    parser.add_argument(
+        "--xrt-bundle",
+        default=str(XRT_BUNDLE_DEFAULT),
+        help="Standalone XRT .tar path or URL (default: bundled tarball path)",
     )
     parser.add_argument("--recreate", action="store_true", help="Delete and recreate the venv from scratch")
     parser.add_argument("--check-only", action="store_true", help="Run /dev/accel and host preflight checks only")
@@ -802,8 +690,7 @@ def main() -> None:
         create_or_reuse_venv(venv_dir, preflight, recreate=args.recreate)
         target_ref = sync_mlir_aie_repo(mlir_aie_dir, channel=args.channel)
         install_python_toolchain(venv_dir, mlir_aie_dir, preflight, channel=args.channel, target_ref=target_ref)
-        install_hrx_runtime(venv_dir, mlir_aie_dir, preflight, channel=args.channel)
-        install_xclbinutil(venv_dir, mlir_aie_dir, preflight)
+        install_xrt_runtime(venv_dir, args.xrt_bundle)
         write_env_integration(venv_dir, preflight)
 
     if not args.skip_test:

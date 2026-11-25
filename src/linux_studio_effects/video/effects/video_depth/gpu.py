@@ -6,10 +6,10 @@ from ..base import ComputeDevice
 from ...models.video_depth_anything.effect_base import VideoDepthEffectBase
 
 
-class GpuVideoDepthEffect(VideoDepthEffectBase):
+class VideoDepthEffect(VideoDepthEffectBase):
     """Runs streaming Video Depth Anything on GPU using PyTorch."""
 
-    supported_devices = (ComputeDevice.GPU,)
+    effect_name = "video_depth"
 
     def __init__(self, *, device: ComputeDevice | str = ComputeDevice.GPU, **kwargs: object) -> None:
         super().__init__(device=device, **kwargs)  # type: ignore[arg-type]

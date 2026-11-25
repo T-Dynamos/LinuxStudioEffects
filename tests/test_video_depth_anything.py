@@ -12,13 +12,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from linux_studio_effects.npu import probe_npu
 from linux_studio_effects.video import (
-    CpuVideoDepthEffect,
     DeviceUnavailableError,
     FrameContext,
-    GpuVideoDepthEffect,
-    NpuVideoDepthEffect,
     is_device_available,
 )
+from linux_studio_effects.video.effects.video_depth.cpu import VideoDepthEffect as CpuVideoDepthEffect
+from linux_studio_effects.video.effects.video_depth.gpu import VideoDepthEffect as GpuVideoDepthEffect
+from linux_studio_effects.video.effects.video_depth.npu import VideoDepthEffect as NpuVideoDepthEffect
 from linux_studio_effects.video.models.video_depth_anything import (
     NpuMatMulExecutor,
     VideoDepthAnythingModel,

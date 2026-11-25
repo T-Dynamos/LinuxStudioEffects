@@ -10,7 +10,7 @@ from ..base import ComputeDevice, FrameContext, FrameEffect
 class SpotlightEffect(FrameEffect):
     """Precomputed radial vignette spotlight to brighten center subject relative to edges."""
 
-    supported_devices = (ComputeDevice.CPU,)
+    effect_name = "spotlight"
 
     def __init__(self, edge_dim: float = 0.45, **kwargs: object) -> None:
         if not 0.0 <= edge_dim <= 1.0:

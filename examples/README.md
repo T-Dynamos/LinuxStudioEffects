@@ -1,6 +1,6 @@
 # Examples
 
-Run any example from the repository root using `iron-env/bin/python` (or any Python `>= 3.11` with `numpy` for the camera-only examples):
+Run any example from the repository root using `iron-env/bin/python` (or Python `>= 3.11` with `numpy` for the camera-only examples):
 
 1. **[01_npu_probe_and_kernel.py](01_npu_probe_and_kernel.py)** — Probe `/dev/accel/accel*`, `amdxdna`, and run a simple `@iron.jit` vector kernel on the AMD Ryzen AI NPU.
    ```bash
@@ -32,7 +32,7 @@ Run any example from the repository root using `iron-env/bin/python` (or any Pyt
    ```
    While it runs, view the virtual webcam from any app (or `ffplay /dev/video4`).
 
-5. **[05_frame_effect_pipeline.py](05_frame_effect_pipeline.py)** — Device-agnostic frame-in -> frame-out -> virtual camera demo combining `FrameEffect` subclasses, plain Python `fn(frame) -> frame` callables, and `EffectChain`.
+5. **[05_frame_effect_pipeline.py](05_frame_effect_pipeline.py)** — Device-agnostic frame graph demo combining `FrameEffect` subclasses and plain Python `fn(frame) -> frame` callables. Each named node can take the camera frame or an earlier effect's output.
    ```bash
    ./iron-env/bin/python examples/05_frame_effect_pipeline.py --effect studio_demo
    ```
@@ -50,4 +50,12 @@ Run any example from the repository root using `iron-env/bin/python` (or any Pyt
 8. **[08_live_video_depth_side_by_side.py](08_live_video_depth_side_by_side.py)** — Fastest streaming Video Depth Anything `Small` side-by-side (`[Input Video | Depth Map]`) live preview / `/dev/video4` / MP4 output.
    ```bash
    ./iron-env/bin/python examples/08_live_video_depth_side_by_side.py --input-size 140 --preview
+   ```
+
+9. **[09_run_effect.py](09_run_effect.py)** — Run any discovered effect/backend on the live camera at its largest advertised resolution and write to `/dev/video4` by default. Configure camera and virtual-camera sizes independently with `--in-size` and `--out-size`. Use `--list` to inspect effect folders, or `--frames 5` for an optional synthetic-frame check. Depth effects use synthetic weights unless `--real-weights` is given.
+   ```bash
+   ./iron-env/bin/python examples/09_run_effect.py --list
+   ./iron-env/bin/python examples/09_run_effect.py --effect mirror
+   ./iron-env/bin/python examples/09_run_effect.py --effect mirror --in-size 2592x1944 --out-size 1920x1080
+   ./iron-env/bin/python examples/09_run_effect.py --effect video_depth --device auto
    ```

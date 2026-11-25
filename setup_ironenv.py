@@ -649,9 +649,9 @@ python3 "{mlir_aie_dir / 'programming_examples' / 'basic' / 'vector_vector_add' 
 def parse_args() -> argparse.Namespace:
     script_dir = pathlib.Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="Set up a self-contained IRON / MLIR-AIE environment in iron-env and test it on the NPU."
+        description="Set up a self-contained IRON / MLIR-AIE environment in .ironenv and test it on the NPU."
     )
-    parser.add_argument("--venv", type=pathlib.Path, default=script_dir / "iron-env", help="Target venv directory")
+    parser.add_argument("--venv", type=pathlib.Path, default=script_dir / ".ironenv", help="Target venv directory")
     parser.add_argument(
         "--mlir-aie-dir",
         type=pathlib.Path,

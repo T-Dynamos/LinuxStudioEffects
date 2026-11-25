@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
+import shutil
+import subprocess
 import sys
 import time
 
@@ -59,6 +62,69 @@ def _synthetic_run(effect, width: int, height: int, fps: float, frames: int) -> 
     return 0
 
 
+def _run_privileged(command: list[str]) -> None:
+    """Run kernel-device management as root, prompting through sudo if needed."""
+    cmd = command if os.geteuid() == 0 else ["sudo", *command]
+    try:
+        result = subprocess.run(cmd, check=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Required command is missing: {cmd[0]}") from exc
+    if result.returncode:
+        raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(cmd)}")
+
+
+def _ensure_loopback_device(device: str):
+    """Create a missing v4l2loopback node and return its matching cleanup callback."""
+    device_path = pathlib.Path(device)
+    if device_path.exists():
+        return None
+
+    number = device_path.name.removeprefix("video")
+    if (
+        device_path.parent != pathlib.Path("/dev")
+        or not device_path.name.startswith("video")
+        or not number.isdigit()
+    ):
+        raise RuntimeError(f"Cannot auto-create {device}: expected a /dev/videoN path")
+
+    if pathlib.Path("/sys/module/v4l2loopback").exists():
+        ctl = shutil.which("v4l2loopback-ctl")
+        if not ctl:
+            raise RuntimeError(
+                "v4l2loopback is loaded but the requested device is missing; "
+                "install v4l2loopback-ctl to create and remove devices dynamically"
+            )
+        _run_privileged([ctl, "add", "--name", "LinuxStudioEffects", "--exclusive-caps", "1", device])
+
+        def cleanup() -> None:
+            _run_privileged([ctl, "delete", device])
+
+    else:
+        modprobe = shutil.which("modprobe") or "/usr/bin/modprobe"
+        _run_privileged(
+            [
+                modprobe,
+                "v4l2loopback",
+                f"video_nr={number}",
+                "card_label=LinuxStudioEffects",
+                "exclusive_caps=1",
+            ]
+        )
+
+        def cleanup() -> None:
+            _run_privileged([modprobe, "-r", "v4l2loopback"])
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if device_path.exists():
+            print(f"Created temporary v4l2loopback device {device}", flush=True)
+            return cleanup
+        time.sleep(0.05)
+
+    cleanup()
+    raise RuntimeError(f"v4l2loopback setup finished, but {device} did not appear")
+
+
 def main() -> int:
     catalog = available_effect_backends()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -74,7 +140,11 @@ def main() -> int:
     parser.add_argument("--input-size", type=int, default=140, help="Depth model input size (multiple of 14)")
     parser.add_argument("--real-weights", action="store_true", help="Load real model weights instead of synthetic weights")
     parser.add_argument("--input-device", default="", help="Camera device; default auto-detect")
-    parser.add_argument("--output-device", default="/dev/video4", help="v4l2loopback output device (default: /dev/video4)")
+    parser.add_argument(
+        "--output-device",
+        default="/dev/video4",
+        help="v4l2loopback output device; a missing /dev/videoN is created and cleaned up automatically",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -107,8 +177,6 @@ def main() -> int:
     loopback = args.output_device
     if not camera:
         parser.error("No accessible camera found; use --frames N to run on synthetic frames")
-    if not pathlib.Path(loopback).exists():
-        parser.error(f"{loopback} does not exist; load v4l2loopback or pass --output-device PATH")
 
     selected_mode = None
     if args.in_size is None and camera_info and camera_info.modes:
@@ -160,7 +228,19 @@ def main() -> int:
         f"{loopback} at {output_width}x{output_height} ({fps:g} fps)",
         flush=True,
     )
-    result = pipeline.run(duration_s=args.duration or None, on_stats=report)
+    try:
+        cleanup_loopback = _ensure_loopback_device(loopback)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    try:
+        result = pipeline.run(duration_s=args.duration or None, on_stats=report)
+    finally:
+        if cleanup_loopback is not None:
+            try:
+                cleanup_loopback()
+                print(f"Removed temporary v4l2loopback device {loopback}", flush=True)
+            except RuntimeError as exc:
+                print(f"WARNING: could not remove temporary loopback device: {exc}", file=sys.stderr)
     print(f"Stopped after {result.frames_out} output frames ({result.output_fps:.2f} fps)")
     return 0
 

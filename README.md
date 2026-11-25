@@ -41,12 +41,30 @@ graph.set_output("blur")
 VideoPipeline(PipelineConfig(), effect=graph).run()
 ```
 
+The camera frame enters the graph, graph nodes can consume the camera or an
+earlier node, and the selected output continues through the pipeline to the
+virtual camera:
+
+```mermaid
+flowchart LR
+    Camera[Camera frame] --> Input
+    subgraph Graph[FrameGraph]
+        Input --> Mirror[Mirror effect]
+        Mirror --> Blur[Blur effect]
+        Input --> Grey[Greyscale effect]
+        Blur --> Selected[Selected graph output]
+        Grey -. alternate output .-> Selected
+    end
+    Selected --> Resize[Output resize and format]
+    Resize --> VCam[Virtual camera /dev/video4]
+```
+
 ### Prerequisites
 - Linux (`x86_64`) with kernel >= 6.14 (`amdxdna` driver exposing `/dev/accel/accel*` with read/write permissions)
 - Python 3.14 (or `uv`) and `git` for NPU setup; the standalone bundle includes XRT, `pyxrt`, and `xclbinutil`
 - No system `xrt` or `xrt-plugin-amdxdna` packages required
 
-### Setup `iron-env` and verify NPU execution
+### Setup `.ironenv` and verify NPU execution
 
 ```bash
 python3 setup_ironenv.py
@@ -60,10 +78,10 @@ Activate in your shell:
 
 ```bash
 # bash / zsh
-source iron-env/bin/activate
+source .ironenv/bin/activate
 
 # fish
-source iron-env/bin/activate.fish
+source .ironenv/bin/activate.fish
 ```
 
 Run the NPU smoke test:
@@ -75,7 +93,7 @@ python3 tests/test_npu_smoke.py
 ## TODO
 
 ### NPU Runtime & Core Pipeline
-- [x] Self-contained `iron-env` setup (`mlir_aie`, `llvm-aie`, standalone XRT, `pyxrt`, `xclbinutil`)
+- [x] Self-contained `.ironenv` setup (`mlir_aie`, `llvm-aie`, standalone XRT, `pyxrt`, `xclbinutil`)
 - [x] `/dev/accel/accel*` & `amdxdna` preflight detection and NPU smoke test
 - [ ] Validate across NPU generations (Phoenix/Hawk Point NPU1, Strix Point/Krackan NPU2)
 - [ ] Zero-copy / persistent DMA ring buffer pipeline for real-time video & audio frames

@@ -17,13 +17,17 @@ Run any example from the repository root using `iron-env/bin/python` (or any Pyt
    ./iron-env/bin/python examples/03_camera_fps_benchmark.py --width 1280 --height 720 --format MJPG --duration 3.0
    ```
 
-4. **[04_virtual_camera_passthrough.py](04_virtual_camera_passthrough.py)** — Run a live camera -> `v4l2loopback` pipeline with independent input/output resolutions and FPS, reporting throughput and CPU usage %.
+4. **[04_virtual_camera_passthrough.py](04_virtual_camera_passthrough.py)** — Run a live camera -> `v4l2loopback` pipeline with interactive or CLI-configured input/output resolutions and FPS, running until `Ctrl+C` while reporting throughput and CPU usage %.
    ```bash
    # Ensure v4l2loopback is loaded first (creates /dev/video4 or next free node):
    # sudo modprobe v4l2loopback devices=1 card_label="LinuxStudioEffects" exclusive_caps=1
 
+   # Interactive prompt (select input mode, output resolution, and FPS; runs until Ctrl+C):
+   ./iron-env/bin/python examples/04_virtual_camera_passthrough.py
+
+   # Or non-interactive with explicit flags:
    ./iron-env/bin/python examples/04_virtual_camera_passthrough.py \
      --in-size 1280x720 --in-fps 30 \
-     --out-size 640x480 --out-fps 30 --duration 10
+     --out-size 640x480 --out-fps 30
    ```
    While it runs, view the virtual webcam from any app (or `ffplay /dev/video4`).

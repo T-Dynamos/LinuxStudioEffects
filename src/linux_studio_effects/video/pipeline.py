@@ -124,61 +124,64 @@ class VideoPipeline:
             target_out_period = (1.0 / cfg.output_fps) if cfg.output_fps > 0 else 0.0
             next_out_deadline = wall_start
 
-            while not self._stop_event.is_set():
-                now = time.monotonic()
-                if duration_s is not None and (now - wall_start) >= duration_s:
-                    break
-                if max_frames is not None and frames_out >= max_frames:
-                    break
+            try:
+                while not self._stop_event.is_set():
+                    now = time.monotonic()
+                    if duration_s is not None and (now - wall_start) >= duration_s:
+                        break
+                    if max_frames is not None and frames_out >= max_frames:
+                        break
 
-                # Determine whether this captured frame should be emitted to output.
-                should_emit = target_out_period <= 0.0 or now >= next_out_deadline - 0.002
-                frame = cam.read_frame(decode=should_emit)
-                frames_in += 1
-                dropped_in += frame.dropped_since_last
-                frame_now = frame.capture_monotonic_s
+                    # Determine whether this captured frame should be emitted to output.
+                    should_emit = target_out_period <= 0.0 or now >= next_out_deadline - 0.002
+                    frame = cam.read_frame(decode=should_emit)
+                    frames_in += 1
+                    dropped_in += frame.dropped_since_last
+                    frame_now = frame.capture_monotonic_s
 
-                if should_emit and frame.data is not None:
-                    t0 = time.perf_counter()
-                    out_rgb = self._processor(frame.data) if self._processor is not None else frame.data
-                    if out_rgb.shape[1] != vcam.negotiated.width or out_rgb.shape[0] != vcam.negotiated.height:
-                        out_rgb = resize_rgb(
-                            out_rgb,
-                            vcam.negotiated.width,
-                            vcam.negotiated.height,
-                            mode=cfg.resize_mode,
+                    if should_emit and frame.data is not None:
+                        t0 = time.perf_counter()
+                        out_rgb = self._processor(frame.data) if self._processor is not None else frame.data
+                        if out_rgb.shape[1] != vcam.negotiated.width or out_rgb.shape[0] != vcam.negotiated.height:
+                            out_rgb = resize_rgb(
+                                out_rgb,
+                                vcam.negotiated.width,
+                                vcam.negotiated.height,
+                                mode=cfg.resize_mode,
+                            )
+                        vcam.write_frame(out_rgb)
+                        proc_ms_samples.append((time.perf_counter() - t0) * 1000.0)
+                        frames_out += 1
+
+                        if target_out_period > 0.0:
+                            next_out_deadline += target_out_period
+                            if next_out_deadline < frame_now:
+                                next_out_deadline = frame_now + target_out_period
+
+                    if on_stats is not None and stats_interval_s > 0 and (frame_now - last_report_wall) >= stats_interval_s:
+                        dt = max(frame_now - last_report_wall, 1e-9)
+                        cpu_now = time.process_time()
+                        d_cpu = max(cpu_now - last_report_cpu, 0.0)
+                        on_stats(
+                            PipelineStats(
+                                input_config=cam.negotiated,
+                                output_config=vcam.negotiated,
+                                frames_in=frames_in - last_report_in,
+                                frames_out=frames_out - last_report_out,
+                                dropped_in=dropped_in,
+                                elapsed_s=dt,
+                                input_fps=(frames_in - last_report_in) / dt,
+                                output_fps=(frames_out - last_report_out) / dt,
+                                avg_process_ms=statistics.fmean(proc_ms_samples[-30:]) if proc_ms_samples else 0.0,
+                                cpu_percent=(d_cpu / dt) * 100.0,
+                            )
                         )
-                    vcam.write_frame(out_rgb)
-                    proc_ms_samples.append((time.perf_counter() - t0) * 1000.0)
-                    frames_out += 1
-
-                    if target_out_period > 0.0:
-                        next_out_deadline += target_out_period
-                        if next_out_deadline < frame_now:
-                            next_out_deadline = frame_now + target_out_period
-
-                if on_stats is not None and stats_interval_s > 0 and (frame_now - last_report_wall) >= stats_interval_s:
-                    dt = max(frame_now - last_report_wall, 1e-9)
-                    cpu_now = time.process_time()
-                    d_cpu = max(cpu_now - last_report_cpu, 0.0)
-                    on_stats(
-                        PipelineStats(
-                            input_config=cam.negotiated,
-                            output_config=vcam.negotiated,
-                            frames_in=frames_in - last_report_in,
-                            frames_out=frames_out - last_report_out,
-                            dropped_in=dropped_in,
-                            elapsed_s=dt,
-                            input_fps=(frames_in - last_report_in) / dt,
-                            output_fps=(frames_out - last_report_out) / dt,
-                            avg_process_ms=statistics.fmean(proc_ms_samples[-30:]) if proc_ms_samples else 0.0,
-                            cpu_percent=(d_cpu / dt) * 100.0,
-                        )
-                    )
-                    last_report_wall = frame_now
-                    last_report_cpu = cpu_now
-                    last_report_in = frames_in
-                    last_report_out = frames_out
+                        last_report_wall = frame_now
+                        last_report_cpu = cpu_now
+                        last_report_in = frames_in
+                        last_report_out = frames_out
+            except KeyboardInterrupt:
+                self._stop_event.set()
 
             total_wall = max(time.monotonic() - wall_start, 1e-9)
             total_cpu = max(time.process_time() - cpu_start, 0.0)

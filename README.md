@@ -1,6 +1,6 @@
 # LinuxStudioEffects
 
-An open-source Linux alternative to **Windows Studio Effects** designed to run real-time camera and microphone AI effects on **AMD Ryzen AI NPUs** (using [MLIR-AIE / IRON](https://github.com/Xilinx/mlir-aie) and the standalone HRX userspace runtime).
+An open-source Linux alternative to **Windows Studio Effects** designed to run real-time camera and microphone AI effects on **AMD Ryzen AI NPUs** (using [MLIR-AIE / IRON](https://github.com/Xilinx/mlir-aie) and a standalone XRT userspace runtime).
 
 ## Project Structure
 
@@ -43,7 +43,7 @@ VideoPipeline(PipelineConfig(), effect=graph).run()
 
 ### Prerequisites
 - Linux (`x86_64`) with kernel >= 6.14 (`amdxdna` driver exposing `/dev/accel/accel*` with read/write permissions)
-- Python 3.11–3.14 (or `uv`), `git`, and a C/C++ compiler (`gcc`/`g++` or `clang`/`clang++`)
+- Python 3.14 (or `uv`) and `git` for NPU setup; the standalone bundle includes XRT, `pyxrt`, and `xclbinutil`
 - No system `xrt` or `xrt-plugin-amdxdna` packages required
 
 ### Setup `iron-env` and verify NPU execution
@@ -51,6 +51,10 @@ VideoPipeline(PipelineConfig(), effect=graph).run()
 ```bash
 python3 setup_ironenv.py
 ```
+
+The setup script defaults to `/home/tdynamos/amdnpu/dist/ryzen-ai-xrt-npu1-linux-x86_64.tar`.
+If the bundle is elsewhere or hosted at a URL with a matching `.sha256` sidecar,
+pass `--xrt-bundle PATH_OR_URL`.
 
 Activate in your shell:
 
@@ -71,7 +75,7 @@ python3 tests/test_npu_smoke.py
 ## TODO
 
 ### NPU Runtime & Core Pipeline
-- [x] Self-contained `iron-env` setup (`mlir_aie`, `llvm-aie`, `libhrx.so`, standalone `hrx-xclbinutil`)
+- [x] Self-contained `iron-env` setup (`mlir_aie`, `llvm-aie`, standalone XRT, `pyxrt`, `xclbinutil`)
 - [x] `/dev/accel/accel*` & `amdxdna` preflight detection and NPU smoke test
 - [ ] Validate across NPU generations (Phoenix/Hawk Point NPU1, Strix Point/Krackan NPU2)
 - [ ] Zero-copy / persistent DMA ring buffer pipeline for real-time video & audio frames

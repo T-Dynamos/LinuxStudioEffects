@@ -1,6 +1,6 @@
 # Examples
 
-Run any example from the repository root using `iron-env/bin/python` (or any Python `>= 3.11` with `numpy` for the camera-only examples):
+Run any example from the repository root using `iron-env/bin/python` (or Python `>= 3.11` with `numpy` for the camera-only examples):
 
 1. **[01_npu_probe_and_kernel.py](01_npu_probe_and_kernel.py)** — Probe `/dev/accel/accel*`, `amdxdna`, and run a simple `@iron.jit` vector kernel on the AMD Ryzen AI NPU.
    ```bash

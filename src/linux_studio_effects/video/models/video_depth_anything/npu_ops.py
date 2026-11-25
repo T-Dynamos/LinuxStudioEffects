@@ -12,8 +12,8 @@ from ml_dtypes import bfloat16
 
 from . import host_ops
 
-# Global re-entrant lock serializing DefaultNPURuntime load/dispatch across threads
-# (libhrx owns one process-wide stream, so background depth + foreground NPU bokeh share safely).
+# Global re-entrant lock serializing NPU load/dispatch across threads. The selected
+# MLIR-AIE host runtime owns the device context shared by depth and portrait blur.
 NPU_DISPATCH_LOCK = threading.RLock()
 
 _NCOLS = 4
@@ -523,8 +523,8 @@ def _compile_matmul_4col(
 class NpuMatMulExecutor:
     """Manages compiled IRON bf16 MatMul handles and persistent NPU weight/IO buffers."""
 
-    # npu1 hardware-context limit in CachedHRXRuntime is 6; bound live handles to 4
-    # so QKV, OutProj, FC1+Bias+GELU, FC2+Bias stay resident without EINVAL reloads.
+    # Bound live handles to 4 so QKV, OutProj, FC1+Bias+GELU, and FC2+Bias
+    # stay resident together under the XRT runtime.
     _MAX_HANDLE_CACHE = 4
 
     def __init__(self) -> None:

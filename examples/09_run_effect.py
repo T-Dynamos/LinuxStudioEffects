@@ -176,6 +176,13 @@ def main() -> int:
     parser.add_argument("--focus-mode", choices=("auto", "manual"), default="auto", help="Focus selection mode")
     parser.add_argument("--focus-depth", type=float, default=0.7, help="Manual focus depth in [0, 1]")
     parser.add_argument("--mask-gamma", type=float, default=1.0, help="CoC mask gamma curve (> 0)")
+    parser.add_argument(
+        "--bg-mode",
+        choices=("blur", "image", "color", "matte"),
+        default="blur",
+        help="Background segmentation composite mode",
+    )
+    parser.add_argument("--bg-image", help="Background replacement image path for background_segmentation --bg-mode image")
     parser.add_argument("--input-device", default="", help="Camera device; default auto-detect")
     parser.add_argument(
         "--pixel-format",
@@ -219,6 +226,24 @@ def main() -> int:
             model_options["variant"] = args.variant
         if args.input_size is not None:
             model_options["input_size"] = args.input_size
+    elif args.effect in ("background_segmentation", "automatic_framing"):
+        use_real = False if args.synthetic_weights else (args.real_weights or not args.frames)
+        use_async = False if args.sync_depth else (args.async_depth or not args.frames)
+        if args.effect == "background_segmentation":
+            model_options = {
+                "mode": args.bg_mode,
+                "background_image": args.bg_image,
+                "quality": args.quality,
+                "use_real_weights": use_real,
+                "async_matte": use_async,
+                "blur_strength": args.blur_strength,
+            }
+        else:
+            model_options = {
+                "quality": args.quality,
+                "use_real_weights": use_real,
+                "async_tracking": use_async,
+            }
     try:
         effect = create_effect(args.effect, device=args.device, **model_options)
     except (DeviceUnavailableError, ImportError) as exc:

@@ -28,6 +28,12 @@ to import a backend lazily. `create_effect("portrait_blur")` selects the best
 implemented backend available on the host (NPU, then GPU, then CPU). Shared
 model code remains under `video/models/`.
 
+- `portrait_blur`: depth-aware bokeh blur backed by Video Depth Anything (`cpu`, `npu`)
+- `background_segmentation`: MODNet portrait matting for background blur, custom image replacement, solid color, or matte output (`cpu`, `npu`)
+- `automatic_framing`: MODNet-tracked upper-body/face pan, crop, and smooth zoom (`cpu`, `npu`)
+
+For optimization details on the portrait blur / depth inference path, see `OPTIMIZE_BLUR_PLAN.md`.
+
 `FrameGraph` lets a node consume the camera frame (`input`) or a prior node's
 output, and its selected output is passed to the existing virtual-camera sink:
 
@@ -105,9 +111,9 @@ python3 tests/test_npu_smoke.py
 - [ ] Custom AIE2 / AIE2p vectorized C++ kernels for image convolutions, resize/warp, and FFT/DSP
 
 ### Video & Camera Effects
-- [ ] **Background Blur (Standard Blur):** Fast segmentation + Gaussian background blur
-- [ ] **Portrait Blur:** Smooth depth/edge-aware bokeh background blur
-- [ ] **Automatic Framing:** Real-time face detection with smooth pan, crop, and zoom tracking
+- [x] **Background Blur & Replacement (`background_segmentation`):** MODNet real-time portrait matting for background blur, virtual image replacement, solid color, or matte output (`cpu`, `npu`)
+- [x] **Portrait Blur (`portrait_blur`):** Smooth depth/edge-aware bokeh background blur via Video Depth Anything (`cpu`, `npu`)
+- [x] **Automatic Framing (`automatic_framing`):** Real-time person/head localization with smooth pan, crop, and zoom tracking (`cpu`, `npu`)
 - [ ] **Eye Contact (Standard):** Subtle gaze redirection toward the camera
 - [ ] **Eye Contact (Teleprompter):** Continuous gaze correction while reading across the screen
 - [ ] **Portrait Light:** Low-light face illumination and exposure balancing

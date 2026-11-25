@@ -137,7 +137,7 @@ class EffectsUnitTests(unittest.TestCase):
 
         frame = np.random.default_rng(42).integers(0, 256, size=(120, 160, 3), dtype=np.uint8)
         for name, factory in BUILTIN_EFFECTS.items():
-            if name.startswith("portrait_blur"):
+            if name.startswith(("portrait_blur", "background_segmentation", "automatic_framing")):
                 continue
             try:
                 eff = factory()
@@ -155,6 +155,24 @@ class EffectsUnitTests(unittest.TestCase):
         self.assertEqual(pb_out.shape, frame.shape)
         self.assertEqual(pb_out.dtype, np.uint8)
         pb.teardown()
+
+        from linux_studio_effects.video.effects.background_segmentation.cpu import BackgroundSegmentationEffect
+
+        bs = BackgroundSegmentationEffect(max_size=128, use_real_weights=False)
+        bs.setup(160, 120, 30.0)
+        bs_out = bs.process(frame, FrameContext(1, 0.0, 160, 120, 30.0, pixel_format="RGB3"))
+        self.assertEqual(bs_out.shape, frame.shape)
+        self.assertEqual(bs_out.dtype, np.uint8)
+        bs.teardown()
+
+        from linux_studio_effects.video.effects.automatic_framing.cpu import AutomaticFramingEffect
+
+        af = AutomaticFramingEffect(max_size=128, use_real_weights=False)
+        af.setup(160, 120, 30.0)
+        af_out = af.process(frame, FrameContext(1, 0.0, 160, 120, 30.0, pixel_format="RGB3"))
+        self.assertEqual(af_out.shape, frame.shape)
+        self.assertEqual(af_out.dtype, np.uint8)
+        af.teardown()
 
         self.assertIs(PassthroughEffect().process(frame), frame)
         mirrored = MirrorEffect().process(frame)
@@ -219,6 +237,8 @@ class EffectsUnitTests(unittest.TestCase):
         catalog = available_effect_backends()
         self.assertNotIn("video_depth", catalog)
         self.assertEqual(catalog["portrait_blur"], ("cpu", "npu"))
+        self.assertEqual(catalog["background_segmentation"], ("cpu", "npu"))
+        self.assertEqual(catalog["automatic_framing"], ("cpu", "npu"))
         self.assertEqual(catalog["greyscale"], ("npu",))
         self.assertEqual(catalog["mirror"], ("cpu", "npu"))
 

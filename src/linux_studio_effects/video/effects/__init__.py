@@ -25,6 +25,8 @@ from .base import (
 )
 
 _LAZY_EFFECTS = {
+    "AutomaticFramingEffect": ("automatic_framing.cpu", "AutomaticFramingEffect"),
+    "BackgroundSegmentationEffect": ("background_segmentation.cpu", "BackgroundSegmentationEffect"),
     "FastBlurEffect": ("fast_blur.cpu", "FastBlurEffect"),
     "GreyscaleEffect": ("greyscale.npu", "GreyscaleEffect"),
     "MirrorEffect": ("mirror.cpu", "MirrorEffect"),
@@ -50,6 +52,12 @@ BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "portrait_blur": _factory("portrait_blur"),
     "portrait_blur_cpu": _factory("portrait_blur", "cpu"),
     "portrait_blur_npu": _factory("portrait_blur", "npu"),
+    "background_segmentation": _factory("background_segmentation"),
+    "background_segmentation_cpu": _factory("background_segmentation", "cpu"),
+    "background_segmentation_npu": _factory("background_segmentation", "npu"),
+    "automatic_framing": _factory("automatic_framing"),
+    "automatic_framing_cpu": _factory("automatic_framing", "cpu"),
+    "automatic_framing_npu": _factory("automatic_framing", "npu"),
 }
 
 
@@ -70,6 +78,8 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "BUILTIN_EFFECTS",
+    "AutomaticFramingEffect",
+    "BackgroundSegmentationEffect",
     "create_effect",
     "available_effect_backends",
     "load_effect_backend",

@@ -53,6 +53,8 @@ from .virtual_cam import (
 
 _LAZY_EFFECT_EXPORTS = {
     "BUILTIN_EFFECTS",
+    "AutomaticFramingEffect",
+    "BackgroundSegmentationEffect",
     "FastBlurEffect",
     "GreyscaleEffect",
     "MirrorEffect",
@@ -80,6 +82,8 @@ def __dir__() -> list[str]:
 __all__ = [
     "ActiveStreamFormat",
     "BUILTIN_EFFECTS",
+    "AutomaticFramingEffect",
+    "BackgroundSegmentationEffect",
     "create_effect",
     "CallableEffect",
     "CameraBenchmarkResult",

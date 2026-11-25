@@ -52,7 +52,7 @@ Run any example from the repository root using `.ironenv/bin/python` (or Python 
    ./.ironenv/bin/python examples/08_live_video_depth_side_by_side.py --input-size 140 --preview
    ```
 
-9. **[09_run_effect.py](09_run_effect.py)** — Run any discovered effect/backend on the live camera, preferring 1920x1080 at 30 fps when the camera advertises a matching native mode, and write to `/dev/video4` by default. Configure camera and virtual-camera sizes independently with `--in-size` and `--out-size`. A missing `/dev/videoN` output is created for this run, assigned to the invoking user, and removed on exit; module changes may prompt for `sudo`. Use `--list` to inspect effect folders, or `--frames 5` for an optional synthetic-frame check. Depth effects use synthetic weights unless `--real-weights` is given.
+9. **[09_run_effect.py](09_run_effect.py)** — Run any discovered effect/backend on the live camera, preferring 1920x1080 at 30 fps when the camera advertises a matching native mode, and output at 1920x1080 by default. Configure camera and virtual-camera sizes independently with `--in-size` and `--out-size`. A missing `/dev/videoN` output is created for this run, assigned to the invoking user, and removed on exit; module changes may prompt for `sudo`. Use `--list` to inspect effect folders, or `--frames 5` for an optional synthetic-frame check. Depth effects use synthetic weights unless `--real-weights` is given.
    ```bash
    ./.ironenv/bin/python examples/09_run_effect.py --list
    ./.ironenv/bin/python examples/09_run_effect.py --effect mirror

@@ -44,6 +44,10 @@
   `README.md` and can be overridden with `--xrt-bundle`.
 - Use `aie.iron` tensors and `aie.utils.DefaultNPURuntime` as the existing NPU
   effect does. Do not silently fall back to CPU in an NPU implementation.
+- IRON's `@iron.jit` inspects `In`, `Out`, and `CompileTime` annotations when
+  decorating nested kernel functions. If those marker types are imported
+  inside a kernel builder, avoid postponed annotations in that module so the
+  markers are actual types rather than unresolved strings.
 - Make NPU kernels preserve the complete native pixel layout. Account for row
   boundaries when partitioning image work across workers; format conversion
   is not a kernel's responsibility in the live pipeline.

@@ -1,7 +1,5 @@
 """NPU horizontal mirror for native packed video frames."""
 
-from __future__ import annotations
-
 from functools import lru_cache
 from typing import Any
 

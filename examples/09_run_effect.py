@@ -150,7 +150,12 @@ def main() -> int:
     parser.add_argument("--effect", choices=sorted(catalog), default="mirror")
     parser.add_argument("--device", choices=("auto", "cpu", "gpu", "npu"), default="auto")
     parser.add_argument("--in-size", type=_size, help="Camera input size; defaults to 1920x1080 when available")
-    parser.add_argument("--out-size", type=_size, help="Virtual camera output size; default matches input")
+    parser.add_argument(
+        "--out-size",
+        type=_size,
+        default=(1920, 1080),
+        help="Virtual camera output size (default 1920x1080)",
+    )
     parser.add_argument("--fps", type=float, help="Frame rate; default request is 30 fps")
     parser.add_argument("--frames", type=int, default=0, help="Process synthetic frames without camera hardware")
     parser.add_argument("--duration", type=float, default=0.0, help="Live run duration; 0 runs until Ctrl+C")
@@ -228,7 +233,7 @@ def main() -> int:
     input_width, input_height = selected_mode.width, selected_mode.height
     input_format = selected_mode.pixel_format
     fps = args.fps if args.fps is not None else 30.0
-    output_width, output_height = args.out_size or (input_width, input_height)
+    output_width, output_height = args.out_size
     if is_yuv422(input_format) and output_width % 2:
         parser.error(f"{input_format} requires an even output width")
 

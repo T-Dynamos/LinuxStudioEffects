@@ -1,4 +1,4 @@
-"""Depth Anything V2 architecture configurations for Small, Base, and Large variants."""
+"""Video Depth Anything architecture configurations for Small, Base, and Large variants."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class DepthAnythingConfig:
-    """Parameterized architecture config covering ViT-S/14, ViT-B/14, and ViT-L/14."""
+class VideoDepthConfig:
+    """Parameterized architecture config covering ViT-S/14, ViT-B/14, and ViT-L/14 + Temporal DPT."""
 
     variant: str
     backbone_name: str
@@ -23,10 +23,15 @@ class DepthAnythingConfig:
     neck_hidden_sizes: tuple[int, int, int, int]
     reassemble_factors: tuple[float, float, float, float]
     head_hidden_size: int
+    num_frames: int
+    temporal_heads: int
+    temporal_norm_groups: int
     hf_repo_id: str
+    checkpoint_filename: str
     license_name: str
-    published_params_m: float
     layer_norm_eps: float = 1e-6
+    temporal_norm_eps: float = 1e-5
+    group_norm_eps: float = 1e-6
 
     def __post_init__(self) -> None:
         if self.input_size <= 0 or self.input_size % self.patch_size != 0:
@@ -57,6 +62,15 @@ class DepthAnythingConfig:
     def num_tokens(self) -> int:
         return self.num_patches + 1  # +1 CLS token
 
+    @property
+    def motion_channels(self) -> tuple[int, int, int, int]:
+        return (
+            self.neck_hidden_sizes[2],
+            self.neck_hidden_sizes[3],
+            self.fusion_hidden_size,
+            self.fusion_hidden_size,
+        )
+
 
 _VARIANT_PRESETS: dict[str, dict[str, object]] = {
     "small": {
@@ -73,9 +87,12 @@ _VARIANT_PRESETS: dict[str, dict[str, object]] = {
         "neck_hidden_sizes": (48, 96, 192, 384),
         "reassemble_factors": (4.0, 2.0, 1.0, 0.5),
         "head_hidden_size": 32,
-        "hf_repo_id": "depth-anything/Depth-Anything-V2-Small-hf",
+        "num_frames": 32,
+        "temporal_heads": 8,
+        "temporal_norm_groups": 32,
+        "hf_repo_id": "depth-anything/Video-Depth-Anything-Small",
+        "checkpoint_filename": "video_depth_anything_vits.pth",
         "license_name": "Apache-2.0",
-        "published_params_m": 24.8,
     },
     "base": {
         "variant": "base",
@@ -91,9 +108,12 @@ _VARIANT_PRESETS: dict[str, dict[str, object]] = {
         "neck_hidden_sizes": (96, 192, 384, 768),
         "reassemble_factors": (4.0, 2.0, 1.0, 0.5),
         "head_hidden_size": 32,
-        "hf_repo_id": "depth-anything/Depth-Anything-V2-Base-hf",
+        "num_frames": 32,
+        "temporal_heads": 8,
+        "temporal_norm_groups": 32,
+        "hf_repo_id": "depth-anything/Video-Depth-Anything-Base",
+        "checkpoint_filename": "video_depth_anything_vitb.pth",
         "license_name": "CC-BY-NC-4.0",
-        "published_params_m": 97.5,
     },
     "large": {
         "variant": "large",
@@ -106,12 +126,15 @@ _VARIANT_PRESETS: dict[str, dict[str, object]] = {
         "default_image_size": 518,
         "tap_indices": (4, 11, 17, 23),
         "fusion_hidden_size": 256,
-        "neck_hidden_sizes": (256, 256, 256, 256),
+        "neck_hidden_sizes": (256, 512, 1024, 1024),
         "reassemble_factors": (4.0, 2.0, 1.0, 0.5),
         "head_hidden_size": 32,
-        "hf_repo_id": "depth-anything/Depth-Anything-V2-Large-hf",
+        "num_frames": 32,
+        "temporal_heads": 8,
+        "temporal_norm_groups": 32,
+        "hf_repo_id": "depth-anything/Video-Depth-Anything-Large",
+        "checkpoint_filename": "video_depth_anything_vitl.pth",
         "license_name": "CC-BY-NC-4.0",
-        "published_params_m": 335.3,
     },
 }
 
@@ -125,12 +148,12 @@ _ALIASES = {
 }
 
 
-def get_depth_config(variant: str = "small", *, input_size: int = 252) -> DepthAnythingConfig:
-    """Build a DepthAnythingConfig for 'small', 'base', or 'large' (or vits/vitb/vitl)."""
+def get_video_depth_config(variant: str = "small", *, input_size: int = 252) -> VideoDepthConfig:
+    """Build a VideoDepthConfig for 'small', 'base', or 'large' (or vits/vitb/vitl)."""
     key = variant.lower().strip()
     key = _ALIASES.get(key, key)
     if key not in _VARIANT_PRESETS:
         raise ValueError(f"Unknown variant {variant!r}; expected one of {tuple(_VARIANT_PRESETS.keys())}")
     params = dict(_VARIANT_PRESETS[key])
     params["input_size"] = input_size
-    return DepthAnythingConfig(**params)  # type: ignore[arg-type]
+    return VideoDepthConfig(**params)  # type: ignore[arg-type]

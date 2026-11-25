@@ -1,4 +1,4 @@
-"""Fast Turbo-style colormap visualization for monocular depth maps."""
+"""Fast Turbo-style colormap visualization for monocular video depth maps."""
 
 from __future__ import annotations
 

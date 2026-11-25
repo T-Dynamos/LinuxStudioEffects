@@ -1,10 +1,10 @@
-"""Analytical FLOP, memory, and hardware feasibility calculator for Depth Anything V2."""
+"""Analytical FLOP, memory, and hardware feasibility calculator for streaming Video Depth Anything."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import DepthAnythingConfig, get_depth_config
+from .config import VideoDepthConfig, get_video_depth_config
 
 
 def _align_up(val: int, mult: int) -> int:
@@ -21,7 +21,7 @@ class FeasibilityReport:
     tokens_padded_npu: int
     total_params: int
     backbone_gflops: float
-    dpt_gflops: float
+    dpt_temporal_gflops: float
     total_gflops: float
     weights_fp32_mb: float
     weights_bf16_mb: float
@@ -38,27 +38,27 @@ class FeasibilityReport:
     realtime_viability: str
 
 
-def _count_params_and_flops(cfg: DepthAnythingConfig) -> tuple[int, float, float]:
+def _count_params_and_flops(cfg: VideoDepthConfig) -> tuple[int, float, float]:
     d = cfg.embed_dim
     mlp = cfg.mlp_dim
     n_tok = cfg.num_tokens
     g = cfg.patch_grid
     p = cfg.patch_size
 
-    # 1. Embeddings: patch conv (3 -> d, 14x14) + cls + pos_embed(518->1370 tokens)
+    # 1. Embeddings
     patch_params = d * (3 * p * p + 1)
     default_tokens = (cfg.default_image_size // p) ** 2 + 1
     embed_params = patch_params + d + default_tokens * d + d  # + mask_token
     patch_flops = 2.0 * cfg.num_patches * d * (3 * p * p)
 
-    # 2. Transformer blocks (QKV, OutProj, Attn QK^T & Attn*V, MLP FC1/FC2, LayerNorms, LayerScales)
+    # 2. Transformer blocks
     block_params = (
-        4 * d * (d + 1)  # Q, K, V, OutProj + biases
-        + 2 * d * mlp + mlp + d  # FC1 + FC2 + biases
-        + 4 * d  # norm1/norm2 weight+bias
-        + 2 * d  # layer_scale1/2
+        4 * d * (d + 1)
+        + 2 * d * mlp + mlp + d
+        + 4 * d
+        + 2 * d
     )
-    backbone_params = embed_params + cfg.depth * block_params + 2 * d  # + backbone.layernorm
+    backbone_params = embed_params + cfg.depth * block_params + 2 * d
 
     qkv_proj_flops = 4.0 * (2.0 * n_tok * d * d)
     attn_flops = 2.0 * cfg.num_heads * (2.0 * n_tok * n_tok * cfg.head_dim)
@@ -71,7 +71,6 @@ def _count_params_and_flops(cfg: DepthAnythingConfig) -> tuple[int, float, float
     dpt_flops = 0.0
     stage_hw: list[tuple[int, int]] = []
     for c_mid, factor in zip(cfg.neck_hidden_sizes, cfg.reassemble_factors):
-        # 1x1 projection: embed_dim -> c_mid at (g, g)
         dpt_params += c_mid * (d + 1)
         dpt_flops += 2.0 * g * g * c_mid * d
 
@@ -85,24 +84,21 @@ def _count_params_and_flops(cfg: DepthAnythingConfig) -> tuple[int, float, float
             dpt_flops += 2.0 * g * g * c_mid * c_mid * 4
         elif factor == 1.0:
             sh, sw = g, g
-        else:  # 0.5 downsample conv 3x3 stride 2
+        else:
             sh, sw = (g + 1) // 2, (g + 1) // 2
             dpt_params += c_mid * c_mid * 9 + c_mid
             dpt_flops += 2.0 * sh * sw * c_mid * c_mid * 9
         stage_hw.append((sh, sw))
 
-        # neck.convs: 3x3 c_mid -> f (no bias)
         dpt_params += f * c_mid * 9
         dpt_flops += 2.0 * sh * sw * f * c_mid * 9
 
-    # fusion_stage: 4 layers, each has projection(1x1) + 2 residual conv units (2 * 3x3 convs)
     for idx, (sh, sw) in enumerate(reversed(stage_hw)):
         res1_convs = 0 if idx == 0 else 2
         convs_3x3 = res1_convs + 2
         dpt_params += (2 + 2) * (f * f * 9 + f) + (f * f + f)
         dpt_flops += 2.0 * sh * sw * (convs_3x3 * f * f * 9 + f * f)
 
-    # Head: conv1 (f -> f//2, 3x3 at stage_0*2), conv2 (f//2 -> 32, 3x3 at input_size), conv3 (32 -> 1, 1x1)
     h0, w0 = stage_hw[0][0] * 2, stage_hw[0][1] * 2
     ih, iw = cfg.input_size, cfg.input_size
     c1 = f // 2
@@ -114,47 +110,62 @@ def _count_params_and_flops(cfg: DepthAnythingConfig) -> tuple[int, float, float
         + ih * iw * c2
     )
 
-    return backbone_params + dpt_params, backbone_flops / 1e9, dpt_flops / 1e9
+    # 4. 4 Temporal MotionModules (streaming single-frame KV-factored mode)
+    # Placed at: layer3 (stage 2), layer4 (stage 3), path4 (stage 2 size), path3 (stage 1 size)
+    motion_spatial = (
+        stage_hw[2][0] * stage_hw[2][1],
+        stage_hw[3][0] * stage_hw[3][1],
+        stage_hw[2][0] * stage_hw[2][1],
+        stage_hw[1][0] * stage_hw[1][1],
+    )
+    motion_params = 0
+    motion_flops = 0.0
+    for ch, n_sp in zip(cfg.motion_channels, motion_spatial):
+        # GroupNorm + proj_in/proj_out + 2*(norm + Q/K/V/Out) + ff_norm + GEGLU FF
+        attn_params = 2 * (4 * ch * ch + ch) + 4 * ch
+        ff_params = 12 * ch * ch + 9 * ch + 2 * ch
+        motion_params += 2 * ch + 2 * (ch * ch + ch) + attn_params + ff_params
+
+        # Streaming FLOPs (per frame: 1 Q, 1 new K/V factorized, 32-frame cross-attn, FF + proj_in/out)
+        proj_flops = 2.0 * n_sp * 2.0 * (ch * ch)
+        t_attn_flops = 2.0 * (
+            2.0 * n_sp * 4.0 * (ch * ch) + 2.0 * n_sp * (2.0 * cfg.num_frames * ch)
+        )
+        ff_flops = 2.0 * n_sp * (12.0 * ch * ch)
+        motion_flops += proj_flops + t_attn_flops + ff_flops
+
+    total_params = backbone_params + dpt_params + motion_params
+    return total_params, backbone_flops / 1e9, (dpt_flops + motion_flops) / 1e9
 
 
 def analyze_feasibility(
-    cfg: DepthAnythingConfig,
+    cfg: VideoDepthConfig,
     *,
     npu_matmul_gflops: float = 150.0,
     npu_dispatch_overhead_ms: float = 1.0,
     gpu_fp16_gflops: float = 1200.0,
     cpu_fp32_gflops: float = 140.0,
 ) -> FeasibilityReport:
-    """Estimate memory footprint, NPU1 SRAM/dispatch feasibility, and realistic FPS bounds.
-
-    Default throughput baselines reflect preloaded-handle 4-column NPU1 bf16 measurements
-    (~150-210 GFLOP/s effective + ~1 ms HRX dispatch/sync overhead per fused-QKV kernel call),
-    Ryzen 7 7840U CPU (OpenBLAS), and Radeon 780M iGPU (gfx1103 FP16 effective).
-    """
-    total_params, bb_gf, dpt_gf = _count_params_and_flops(cfg)
-    tot_gf = bb_gf + dpt_gf
+    """Estimate memory footprint, NPU1 SRAM/dispatch feasibility, and streaming FPS bounds."""
+    total_params, bb_gf, dpt_t_gf = _count_params_and_flops(cfg)
+    tot_gf = bb_gf + dpt_t_gf
 
     w_fp32_mb = (total_params * 4) / (1024 * 1024)
     w_bf16_mb = (total_params * 2) / (1024 * 1024)
     w_int8_mb = total_params / (1024 * 1024)
 
-    tokens_pad = _align_up(cfg.num_tokens, 128)  # 4 cols * 32-row tile
-    # Largest per-layer activation is attention matrix (num_heads, tokens, tokens) or MLP (tokens, mlp_dim)
+    tokens_pad = _align_up(cfg.num_tokens, 128)
     attn_act = cfg.num_heads * cfg.num_tokens * cfg.num_tokens * 2
     mlp_act = tokens_pad * cfg.mlp_dim * 2
     peak_act_mb = max(attn_act, mlp_act) / (1024 * 1024)
 
-    # Dispatches when each Transformer linear projection (QKV, OutProj, FC1, FC2) runs on NPU:
-    # 1 patch embed + depth * (fused-QKV + OutProj + FC1 + FC2)
-    npu_dispatches = 1 + cfg.depth * 4
-
-    # NPU1 tile fit: 32x64 @ 64x64 bf16 uses 4KB + 8KB + 4KB = 16KB (*2 ping-pong = 32KB <= 64KB SRAM)
+    # Fused QKV + OutProj + FC1 + FC2 per ViT block
+    npu_dispatches = cfg.depth * 4
     npu_sram_fit = True
 
-    # Realistic NPU1 latency = compute time + per-dispatch HRX/IRON overhead
-    npu_ms = (bb_gf / npu_matmul_gflops) * 1000.0 + npu_dispatches * npu_dispatch_overhead_ms + (dpt_gf / cpu_fp32_gflops) * 1000.0
-    gpu_ms = (tot_gf / gpu_fp16_gflops) * 1000.0 + 4.0  # kernel launch overhead
-    cpu_ms = (tot_gf / cpu_fp32_gflops) * 1000.0 + 5.0
+    npu_ms = (bb_gf / npu_matmul_gflops) * 1000.0 + npu_dispatches * npu_dispatch_overhead_ms + (dpt_t_gf / cpu_fp32_gflops) * 1000.0
+    gpu_ms = (tot_gf / gpu_fp16_gflops) * 1000.0 + 5.0
+    cpu_ms = (tot_gf / cpu_fp32_gflops) * 1000.0 + 6.0
 
     npu_fps = 1000.0 / npu_ms
     gpu_fps = 1000.0 / gpu_ms
@@ -163,9 +174,9 @@ def analyze_feasibility(
     if npu_fps >= 15.0:
         viability = "Real-time on NPU1"
     elif gpu_fps >= 15.0:
-        viability = "Real-time on GPU; NPU1 dispatch-bound without operator fusion"
+        viability = "Real-time on GPU; hybrid NPU1+CPU streaming"
     elif cpu_fps >= 5.0:
-        viability = "Interactive on GPU/CPU; too slow on NPU1 w/o INT8+fusion"
+        viability = "Interactive on GPU/CPU; heavy on NPU1"
     else:
         viability = "Offline / low-FPS on laptop APU (very heavy)"
 
@@ -176,7 +187,7 @@ def analyze_feasibility(
         tokens_padded_npu=tokens_pad,
         total_params=total_params,
         backbone_gflops=bb_gf,
-        dpt_gflops=dpt_gf,
+        dpt_temporal_gflops=dpt_t_gf,
         total_gflops=tot_gf,
         weights_fp32_mb=w_fp32_mb,
         weights_bf16_mb=w_bf16_mb,
@@ -198,20 +209,19 @@ def format_feasibility_table(
     variants: tuple[str, ...] = ("small", "base", "large"),
     input_sizes: tuple[int, ...] = (252, 336, 518),
 ) -> str:
-    """Render an ASCII feasibility comparison matrix across variants and resolutions."""
-    header = (
-        f"{'Variant':7s} {'Res':>7s} {'Params':>8s} {'GFLOPs':>8s} {'BF16 MB':>8s} {'INT8 MB':>8s} "
-        f"{'NPU1 ms':>9s} {'CPU ms':>8s} {'GPU ms':>8s}  {'Assessment'}"
-    )
-    sep = "-" * len(header)
-    lines = [header, sep]
-    for var in variants:
+    """Format a human-readable multi-variant hardware feasibility matrix."""
+    lines = [
+        f"{'Variant':<7} {'Res':>7} {'Params':>8} {'GFLOPs':>8} {'BF16 MB':>8} {'INT8 MB':>8} "
+        f"{'NPU1 ms':>8} {'CPU ms':>8} {'GPU ms':>8}  Assessment",
+        "-" * 91,
+    ]
+    for v in variants:
         for sz in input_sizes:
-            rep = analyze_feasibility(get_depth_config(var, input_size=sz))
+            r = analyze_feasibility(get_video_depth_config(v, input_size=sz))
             lines.append(
-                f"{rep.variant:7s} {f'{sz}x{sz}':>7s} {rep.total_params/1e6:7.1f}M "
-                f"{rep.total_gflops:8.1f} {rep.weights_bf16_mb:8.1f} {rep.weights_int8_mb:8.1f} "
-                f"{rep.npu1_estimated_ms:9.0f} {rep.cpu_7840u_estimated_ms:8.0f} {rep.gpu_780m_estimated_ms:8.0f}  "
-                f"{rep.realtime_viability}"
+                f"{r.variant:<7} {sz:>3}x{sz:<3} {r.total_params / 1e6:7.1f}M {r.total_gflops:8.1f} "
+                f"{r.weights_bf16_mb:8.1f} {r.weights_int8_mb:8.1f} "
+                f"{r.npu1_estimated_ms:8.0f} {r.cpu_7840u_estimated_ms:8.0f} {r.gpu_780m_estimated_ms:8.0f}  "
+                f"{r.realtime_viability}"
             )
     return "\n".join(lines)

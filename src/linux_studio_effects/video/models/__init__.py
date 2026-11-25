@@ -1,5 +1,5 @@
 """Neural network model implementations for LinuxStudioEffects."""
 
-from . import depth_anything_v2
+from . import video_depth_anything
 
-__all__ = ["depth_anything_v2"]
+__all__ = ["video_depth_anything"]

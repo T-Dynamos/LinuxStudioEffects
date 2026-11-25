@@ -1,5 +1,5 @@
 """GPU-accelerated video frame effects (one effect per module)."""
 
-from .depth_anything import GpuDepthAnythingEffect
+from .video_depth import GpuVideoDepthEffect
 
-__all__ = ["GpuDepthAnythingEffect"]
+__all__ = ["GpuVideoDepthEffect"]

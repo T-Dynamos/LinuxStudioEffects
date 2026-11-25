@@ -1,13 +1,13 @@
-"""PyTorch GPU (ROCm/CUDA/XPU) Depth Anything V2 monocular depth -> Turbo colormap video effect."""
+"""PyTorch GPU Video Depth Anything streaming monocular depth -> Turbo colormap video effect."""
 
 from __future__ import annotations
 
 from ..base import ComputeDevice
-from ...models.depth_anything_v2.effect_base import DepthAnythingEffectBase
+from ...models.video_depth_anything.effect_base import VideoDepthEffectBase
 
 
-class GpuDepthAnythingEffect(DepthAnythingEffectBase):
-    """Runs Depth Anything V2 on GPU using PyTorch."""
+class GpuVideoDepthEffect(VideoDepthEffectBase):
+    """Runs streaming Video Depth Anything on GPU using PyTorch."""
 
     supported_devices = (ComputeDevice.GPU,)
 

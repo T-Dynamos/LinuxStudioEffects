@@ -128,27 +128,27 @@ class EffectsUnitTests(unittest.TestCase):
 
     def test_effects_organized_by_device_and_single_file(self) -> None:
         from linux_studio_effects.video.effects import gpu, npu
-        from linux_studio_effects.video.effects.cpu.depth_anything import CpuDepthAnythingEffect
         from linux_studio_effects.video.effects.cpu.fast_blur import FastBlurEffect as CpuBlur
         from linux_studio_effects.video.effects.cpu.mirror import MirrorEffect as CpuMirror
         from linux_studio_effects.video.effects.cpu.passthrough import PassthroughEffect as CpuPass
         from linux_studio_effects.video.effects.cpu.spotlight import SpotlightEffect as CpuSpot
+        from linux_studio_effects.video.effects.cpu.video_depth import CpuVideoDepthEffect
         from linux_studio_effects.video.effects.cpu.zoom_crop import ZoomCropEffect as CpuZoom
-        from linux_studio_effects.video.effects.gpu.depth_anything import GpuDepthAnythingEffect
-        from linux_studio_effects.video.effects.npu.depth_anything import NpuDepthAnythingEffect
+        from linux_studio_effects.video.effects.gpu.video_depth import GpuVideoDepthEffect
         from linux_studio_effects.video.effects.npu.greyscale import GreyscaleEffect as NpuGrey
+        from linux_studio_effects.video.effects.npu.video_depth import NpuVideoDepthEffect
 
         self.assertIs(CpuBlur, FastBlurEffect)
         self.assertIs(CpuMirror, MirrorEffect)
         self.assertIs(CpuPass, PassthroughEffect)
         self.assertIs(CpuSpot, SpotlightEffect)
         self.assertIs(CpuZoom, ZoomCropEffect)
-        self.assertEqual(CpuDepthAnythingEffect.supported_devices, (ComputeDevice.CPU,))
-        self.assertEqual(NpuDepthAnythingEffect.supported_devices, (ComputeDevice.NPU,))
-        self.assertEqual(GpuDepthAnythingEffect.supported_devices, (ComputeDevice.GPU,))
-        self.assertEqual(npu.__all__, ["GreyscaleEffect", "NpuDepthAnythingEffect"])
+        self.assertEqual(CpuVideoDepthEffect.supported_devices, (ComputeDevice.CPU,))
+        self.assertEqual(NpuVideoDepthEffect.supported_devices, (ComputeDevice.NPU,))
+        self.assertEqual(GpuVideoDepthEffect.supported_devices, (ComputeDevice.GPU,))
+        self.assertEqual(npu.__all__, ["GreyscaleEffect", "NpuVideoDepthEffect"])
         self.assertEqual(NpuGrey.supported_devices, (ComputeDevice.NPU,))
-        self.assertEqual(gpu.__all__, ["GpuDepthAnythingEffect"])
+        self.assertEqual(gpu.__all__, ["GpuVideoDepthEffect"])
 
 
 class EffectsPipelineLiveTests(unittest.TestCase):

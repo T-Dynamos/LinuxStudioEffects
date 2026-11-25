@@ -16,15 +16,15 @@ from .base import (
     resolve_compute_device,
 )
 from .cpu import (
-    CpuDepthAnythingEffect,
+    CpuVideoDepthEffect,
     FastBlurEffect,
     MirrorEffect,
     PassthroughEffect,
     SpotlightEffect,
     ZoomCropEffect,
 )
-from .gpu import GpuDepthAnythingEffect
-from .npu import GreyscaleEffect, NpuDepthAnythingEffect
+from .gpu import GpuVideoDepthEffect
+from .npu import GreyscaleEffect, NpuVideoDepthEffect
 
 BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "none": PassthroughEffect,
@@ -33,24 +33,26 @@ BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "spotlight": SpotlightEffect,
     "blur": FastBlurEffect,
     "greyscale": GreyscaleEffect,
-    "depth_cpu": CpuDepthAnythingEffect,
-    "depth_npu": NpuDepthAnythingEffect,
+    "depth_cpu": CpuVideoDepthEffect,
+    "depth_npu": NpuVideoDepthEffect,
+    "video_depth_cpu": CpuVideoDepthEffect,
+    "video_depth_npu": NpuVideoDepthEffect,
 }
 
 __all__ = [
     "BUILTIN_EFFECTS",
     "CallableEffect",
     "ComputeDevice",
-    "CpuDepthAnythingEffect",
+    "CpuVideoDepthEffect",
     "DeviceUnavailableError",
     "EffectChain",
     "FastBlurEffect",
     "FrameContext",
     "FrameEffect",
-    "GpuDepthAnythingEffect",
+    "GpuVideoDepthEffect",
     "GreyscaleEffect",
     "MirrorEffect",
-    "NpuDepthAnythingEffect",
+    "NpuVideoDepthEffect",
     "PassthroughEffect",
     "SpotlightEffect",
     "ZoomCropEffect",

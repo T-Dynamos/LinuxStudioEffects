@@ -16,6 +16,7 @@ from .base import (
     resolve_compute_device,
 )
 from .cpu import (
+    CpuPortraitBlurEffect,
     CpuVideoDepthEffect,
     FastBlurEffect,
     MirrorEffect,
@@ -24,7 +25,7 @@ from .cpu import (
     ZoomCropEffect,
 )
 from .gpu import GpuVideoDepthEffect
-from .npu import GreyscaleEffect, NpuVideoDepthEffect
+from .npu import GreyscaleEffect, NpuPortraitBlurEffect, NpuVideoDepthEffect
 
 BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "none": PassthroughEffect,
@@ -37,12 +38,15 @@ BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "depth_npu": NpuVideoDepthEffect,
     "video_depth_cpu": CpuVideoDepthEffect,
     "video_depth_npu": NpuVideoDepthEffect,
+    "portrait_blur_cpu": CpuPortraitBlurEffect,
+    "portrait_blur_npu": NpuPortraitBlurEffect,
 }
 
 __all__ = [
     "BUILTIN_EFFECTS",
     "CallableEffect",
     "ComputeDevice",
+    "CpuPortraitBlurEffect",
     "CpuVideoDepthEffect",
     "DeviceUnavailableError",
     "EffectChain",
@@ -52,6 +56,7 @@ __all__ = [
     "GpuVideoDepthEffect",
     "GreyscaleEffect",
     "MirrorEffect",
+    "NpuPortraitBlurEffect",
     "NpuVideoDepthEffect",
     "PassthroughEffect",
     "SpotlightEffect",

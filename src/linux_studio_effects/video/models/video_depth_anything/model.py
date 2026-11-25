@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from . import host_ops
 from .config import VideoDepthConfig
 from .npu_ops import NpuExecStats, NpuMatMulExecutor
 from .weights import MotionModuleWeights, TemporalAttentionWeights, VideoDepthWeights
@@ -69,36 +70,8 @@ class _MotionCtx:
 
 
 def _bilinear_resize_nchw(x: np.ndarray, out_h: int, out_w: int, *, align_corners: bool = True) -> np.ndarray:
-    """Two-pass separable bilinear interpolation matching torch.nn.functional.interpolate."""
-    _, _, in_h, in_w = x.shape
-    if in_h == out_h and in_w == out_w:
-        return x
-
-    if out_w == 1:
-        x_coords = np.zeros((1,), dtype=np.float32)
-    elif align_corners:
-        x_coords = np.linspace(0.0, in_w - 1, out_w, dtype=np.float32)
-    else:
-        x_coords = np.clip((np.arange(out_w, dtype=np.float32) + 0.5) * (in_w / out_w) - 0.5, 0.0, in_w - 1)
-
-    if out_h == 1:
-        y_coords = np.zeros((1,), dtype=np.float32)
-    elif align_corners:
-        y_coords = np.linspace(0.0, in_h - 1, out_h, dtype=np.float32)
-    else:
-        y_coords = np.clip((np.arange(out_h, dtype=np.float32) + 0.5) * (in_h / out_h) - 0.5, 0.0, in_h - 1)
-
-    x0 = np.floor(x_coords).astype(np.int64)
-    x1 = np.minimum(x0 + 1, in_w - 1)
-    wx = (x_coords - x0)[None, None, None, :]
-
-    y0 = np.floor(y_coords).astype(np.int64)
-    y1 = np.minimum(y0 + 1, in_h - 1)
-    wy = (y_coords - y0)[None, None, :, None]
-
-    # Separable 1D passes reduce tensor copies from 4x 2D gathers to 2x 1D gathers.
-    tmp = x[:, :, :, x0] * (1.0 - wx) + x[:, :, :, x1] * wx
-    return (tmp[:, :, y0, :] * (1.0 - wy) + tmp[:, :, y1, :] * wy).astype(np.float32, copy=False)
+    """AVX-512 / two-pass separable bilinear interpolation matching torch.nn.functional.interpolate."""
+    return host_ops.bilinear_resize_nchw(x, out_h, out_w, align_corners=align_corners)
 
 
 def _bicubic_keys_weights(t: np.ndarray, a: float = -0.75) -> np.ndarray:
@@ -147,10 +120,7 @@ def _bicubic_resize_hwc(
 
 
 def _layer_norm(x: np.ndarray, weight: np.ndarray, bias: np.ndarray, eps: float) -> np.ndarray:
-    mean = np.mean(x, axis=-1, keepdims=True)
-    diff = x - mean
-    var = np.mean(diff * diff, axis=-1, keepdims=True)
-    return (diff / np.sqrt(var + eps)) * weight + bias
+    return host_ops.layer_norm(x, weight, bias, eps=eps)
 
 
 def _group_norm_nchw(
@@ -160,25 +130,16 @@ def _group_norm_nchw(
     bias: np.ndarray,
     eps: float = 1e-6,
 ) -> np.ndarray:
-    n, c, h, w = x.shape
-    g_arr = x.reshape(n, num_groups, c // num_groups, h * w)
-    mean = np.mean(g_arr, axis=(2, 3), keepdims=True)
-    diff = g_arr - mean
-    var = np.mean(diff * diff, axis=(2, 3), keepdims=True)
-    normed = (diff / np.sqrt(var + eps)).reshape(n, c, h, w)
-    return normed * weight[None, :, None, None] + bias[None, :, None, None]
+    return host_ops.group_norm_nchw(x, num_groups, weight, bias, eps=eps)
 
 
 def _gelu(x: np.ndarray) -> np.ndarray:
-    return (np.float32(0.5) * x * (np.float32(1.0) + np.tanh(np.float32(0.79788456) * (x + np.float32(0.044715) * (x * x * x))))).astype(
-        np.float32, copy=False
-    )
+    out = np.array(x, dtype=np.float32, copy=True)
+    return host_ops.gelu_inplace(out)
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
-    m = np.max(x, axis=-1, keepdims=True)
-    e = np.exp(x - m)
-    return e / np.sum(e, axis=-1, keepdims=True)
+    return host_ops.softmax_rows(x)
 
 
 def _conv2d_nchw(
@@ -206,6 +167,9 @@ def _conv2d_nchw(
         if bias is not None:
             out = out + bias.reshape(1, c_out, 1, 1)
         return out
+
+    if kh == 3 and kw == 3 and stride == 1 and padding == 1:
+        return host_ops.conv2d_3x3_s1_p1(x, w_mat, bias)
 
     x_pad = np.pad(x, ((0, 0), (0, 0), (padding, padding), (padding, padding)), mode="constant") if padding > 0 else x
     oh = (h + 2 * padding - kh) // stride + 1
@@ -383,13 +347,21 @@ class VideoDepthAnythingModel:
             self._deconv_wt_cache[wid] = w2
         return w2
 
-    def _linear(self, x: np.ndarray, weight_out_in: np.ndarray, bias: np.ndarray) -> np.ndarray:
+    def _linear(
+        self,
+        x: np.ndarray,
+        weight_out_in: np.ndarray,
+        bias: np.ndarray,
+        *,
+        activation: str | None = None,
+    ) -> np.ndarray:
         wt = self._wt(weight_out_in)
         if self._npu_mm is not None:
-            y = self._npu_mm.matmul(x, wt, cache_b=True)
-        else:
-            y = x @ wt
-        return y + bias
+            return self._npu_mm.matmul(x, wt, bias=bias, activation=activation, cache_b=True)
+        y = x @ wt + bias
+        if activation == "gelu":
+            return host_ops.gelu_inplace(y)
+        return y
 
     def preprocess(self, rgb: np.ndarray) -> np.ndarray:
         """Resize (H, W, 3) uint8 RGB frame to (1, 3, S, S) normalized float32."""
@@ -443,7 +415,7 @@ class VideoDepthAnythingModel:
             x = x + attn_out * blk.ls1
 
             h_norm2 = _layer_norm(x, blk.norm2_weight, blk.norm2_bias, cfg.layer_norm_eps)
-            mlp_hid = _gelu(self._linear(h_norm2, blk.fc1_weight, blk.fc1_bias))
+            mlp_hid = self._linear(h_norm2, blk.fc1_weight, blk.fc1_bias, activation="gelu")
             mlp_out = self._linear(mlp_hid, blk.fc2_weight, blk.fc2_bias)
             x = x + mlp_out * blk.ls2
 

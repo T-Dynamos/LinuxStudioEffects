@@ -24,7 +24,7 @@ from linux_studio_effects.video import (
     check_camera_deps,
     pick_default_loopback,
 )
-from linux_studio_effects.video.effects.npu.greyscale import select_npu_tiling
+from linux_studio_effects.video.effects.greyscale.npu import select_npu_tiling
 
 
 def _ref_greyscale(rgb: np.ndarray) -> np.ndarray:

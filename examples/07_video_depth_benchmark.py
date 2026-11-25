@@ -11,7 +11,6 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from linux_studio_effects.video import (
-    NpuVideoDepthEffect,
     PipelineConfig,
     V4L2Camera,
     VideoPipeline,
@@ -19,6 +18,7 @@ from linux_studio_effects.video import (
     pick_default_camera,
     pick_default_loopback,
 )
+from linux_studio_effects.video.effects.video_depth.npu import VideoDepthEffect
 from linux_studio_effects.video.models.video_depth_anything import (
     VideoDepthAnythingModel,
     create_synthetic_weights,
@@ -134,7 +134,7 @@ def main() -> int:
         if loopback is None:
             print("No v4l2loopback device found for --live mode.", file=sys.stderr)
             return 1
-        eff = NpuVideoDepthEffect(
+        eff = VideoDepthEffect(
             variant=args.variants[0],
             input_size=args.input_size,
             use_real_weights=args.real_weights or (args.variants[0] == "small"),

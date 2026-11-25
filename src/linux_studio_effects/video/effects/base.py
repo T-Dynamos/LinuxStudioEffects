@@ -101,6 +101,7 @@ class FrameEffect(ABC):
     """Base interface for a frame-in -> frame-out video processor on CPU, NPU, or GPU."""
 
     supported_devices: tuple[ComputeDevice, ...] = (ComputeDevice.CPU,)
+    effect_name: str | None = None
 
     def __init__(
         self,
@@ -109,7 +110,7 @@ class FrameEffect(ABC):
         device: ComputeDevice | str = ComputeDevice.AUTO,
         enabled: bool = True,
     ) -> None:
-        self.name = name or type(self).__name__
+        self.name = name or self.effect_name or type(self).__name__
         self.requested_device = ComputeDevice(device.lower()) if isinstance(device, str) else device
         self.active_device = resolve_compute_device(self.requested_device, self.supported_devices)
         self.enabled = enabled
@@ -186,7 +187,6 @@ class EffectChain(FrameEffect):
         return self
 
     def set_enabled(self, name: str, enabled: bool) -> bool:
-        """Enable or disable the first matching effect by name; returns True if found."""
         for eff in self._effects:
             if eff.name == name:
                 eff.enabled = enabled
@@ -194,7 +194,6 @@ class EffectChain(FrameEffect):
         return False
 
     def toggle(self, name: str) -> bool | None:
-        """Toggle an effect's enabled state by name; returns new state or None if missing."""
         for eff in self._effects:
             if eff.name == name:
                 eff.enabled = not eff.enabled
@@ -216,6 +215,63 @@ class EffectChain(FrameEffect):
     def teardown(self) -> None:
         for eff in reversed(self._effects):
             eff.teardown()
+        self._is_setup = False
+
+
+class FrameGraph(FrameEffect):
+    """A named, acyclic graph of frame effects with selectable upstream inputs.
+
+    Each node receives either the original source frame (``source="input"``)
+    or the output of an earlier node. The selected output node is returned.
+    Nodes execute in insertion order, which makes forward references invalid.
+    """
+
+    def __init__(self, *, output: str | None = None, name: str = "FrameGraph") -> None:
+        self.name = name
+        self.requested_device = ComputeDevice.AUTO
+        self.active_device = ComputeDevice.CPU
+        self.enabled = True
+        self._is_setup = False
+        self._nodes: list[tuple[str, str, FrameEffect]] = []
+        self._output = output
+
+    @property
+    def nodes(self) -> tuple[tuple[str, str, FrameEffect], ...]:
+        return tuple(self._nodes)
+
+    def add(self, name: str, effect: FrameEffect | Callable[[np.ndarray], np.ndarray], *, source: str = "input") -> FrameGraph:
+        if not name or name == "input" or any(n == name for n, _, _ in self._nodes):
+            raise ValueError(f"Invalid or duplicate graph node name: {name!r}")
+        available = {"input", *(n for n, _, _ in self._nodes)}
+        if source not in available:
+            raise ValueError(f"Unknown source {source!r}; nodes can only use earlier outputs")
+        self._nodes.append((name, source, as_frame_effect(effect)))
+        if self._output is None:
+            self._output = name
+        return self
+
+    def set_output(self, name: str) -> FrameGraph:
+        if name != "input" and name not in {n for n, _, _ in self._nodes}:
+            raise ValueError(f"Unknown graph output {name!r}")
+        self._output = name
+        return self
+
+    def setup(self, width: int, height: int, fps: float) -> None:
+        for _, _, effect in self._nodes:
+            effect.setup(width, height, fps)
+        self._is_setup = True
+
+    def process(self, frame: np.ndarray, ctx: FrameContext | None = None) -> np.ndarray:
+        outputs: dict[str, np.ndarray] = {"input": frame}
+        for name, source, effect in self._nodes:
+            outputs[name] = effect(outputs[source], ctx) if effect.enabled else outputs[source]
+        if self._output is None:
+            return frame
+        return outputs[self._output]
+
+    def teardown(self) -> None:
+        for _, _, effect in reversed(self._nodes):
+            effect.teardown()
         self._is_setup = False
 
 

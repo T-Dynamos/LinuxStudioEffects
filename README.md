@@ -19,6 +19,26 @@ LinuxStudioEffects/
 
 ## Quickstart
 
+### Effect layout and composition
+
+Effects are grouped by behavior under `video/effects/<effect>/`. A backend is
+implemented only when its file exists (`cpu.py`, `gpu.py`, or `npu.py`); use
+`available_effect_backends()` to inspect the catalog and `load_effect_backend()`
+to import a backend lazily. Shared model code remains under `video/models/`.
+
+`FrameGraph` lets a node consume the camera frame (`input`) or a prior node's
+output, and its selected output is passed to the existing virtual-camera sink:
+
+```python
+from linux_studio_effects.video import FastBlurEffect, FrameGraph, MirrorEffect, PipelineConfig, VideoPipeline
+
+graph = FrameGraph()
+graph.add("mirror", MirrorEffect())
+graph.add("blur", FastBlurEffect(), source="mirror")
+graph.set_output("blur")
+VideoPipeline(PipelineConfig(), effect=graph).run()
+```
+
 ### Prerequisites
 - Linux (`x86_64`) with kernel >= 6.14 (`amdxdna` driver exposing `/dev/accel/accel*` with read/write permissions)
 - Python 3.11–3.14 (or `uv`), `git`, and a C/C++ compiler (`gcc`/`g++` or `clang`/`clang++`)

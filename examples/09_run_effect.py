@@ -163,9 +163,19 @@ def main() -> int:
     parser.add_argument("--fps", type=float, help="Frame rate; default request is 30 fps")
     parser.add_argument("--frames", type=int, default=0, help="Process synthetic frames without camera hardware")
     parser.add_argument("--duration", type=float, default=0.0, help="Live run duration; 0 runs until Ctrl+C")
-    parser.add_argument("--variant", choices=("small", "base", "large"), default="small", help="Depth model variant")
-    parser.add_argument("--input-size", type=int, default=140, help="Depth model input size (multiple of 14)")
-    parser.add_argument("--real-weights", action="store_true", help="Load real model weights instead of synthetic weights")
+    parser.add_argument("--quality", choices=("fast", "balanced", "high"), default="balanced", help="Portrait blur quality preset")
+    parser.add_argument("--variant", choices=("small", "base", "large"), help="Override depth model variant")
+    parser.add_argument("--input-size", type=int, help="Override depth model input size (multiple of 14)")
+    parser.add_argument("--real-weights", action="store_true", help="Load real model weights (default for live portrait_blur)")
+    parser.add_argument("--synthetic-weights", action="store_true", help="Force synthetic weights even for live portrait_blur")
+    parser.add_argument("--async-depth", action="store_true", help="Run depth inference asynchronously (default for live portrait_blur)")
+    parser.add_argument("--sync-depth", action="store_true", help="Run depth inference synchronously on every frame")
+    parser.add_argument("--blur-strength", type=float, default=1.0, help="Portrait blur strength in [0, 1] (default: 1.0)")
+    parser.add_argument("--dof-range", type=float, default=0.30, help="Sharp foreground depth range (default: 0.30)")
+    parser.add_argument("--falloff", type=float, default=0.20, help="Blur transition depth falloff (default: 0.20)")
+    parser.add_argument("--focus-mode", choices=("auto", "manual"), default="auto", help="Focus selection mode")
+    parser.add_argument("--focus-depth", type=float, default=0.7, help="Manual focus depth in [0, 1]")
+    parser.add_argument("--mask-gamma", type=float, default=1.0, help="CoC mask gamma curve (> 0)")
     parser.add_argument("--input-device", default="", help="Camera device; default auto-detect")
     parser.add_argument(
         "--pixel-format",
@@ -189,14 +199,26 @@ def main() -> int:
         parser.error("Input and output resolutions must match; set --in-size and --out-size to the same WxH")
 
     model_options: dict[str, object] = {}
-    if args.effect in {"video_depth", "portrait_blur"}:
-        if args.input_size <= 0 or args.input_size % 14:
-            parser.error("--input-size must be a positive multiple of 14 for depth effects")
+    if args.effect == "portrait_blur":
+        if args.input_size is not None and (args.input_size <= 0 or args.input_size % 14):
+            parser.error("--input-size must be a positive multiple of 14 for portrait_blur")
+        use_real = False if args.synthetic_weights else (args.real_weights or not args.frames)
+        use_async = False if args.sync_depth else (args.async_depth or not args.frames)
         model_options = {
-            "variant": args.variant,
-            "input_size": args.input_size,
-            "use_real_weights": args.real_weights,
+            "quality": args.quality,
+            "use_real_weights": use_real,
+            "async_depth": use_async,
+            "blur_strength": args.blur_strength,
+            "dof_range": args.dof_range,
+            "falloff": args.falloff,
+            "focus_mode": args.focus_mode,
+            "focus_depth": args.focus_depth,
+            "mask_gamma": args.mask_gamma,
         }
+        if args.variant is not None:
+            model_options["variant"] = args.variant
+        if args.input_size is not None:
+            model_options["input_size"] = args.input_size
     try:
         effect = create_effect(args.effect, device=args.device, **model_options)
     except (DeviceUnavailableError, ImportError) as exc:
@@ -212,7 +234,7 @@ def main() -> int:
     if not camera:
         parser.error("No accessible camera found; use --frames N to run on synthetic frames")
 
-    effect_formats = ("RGB3",) if args.effect in {"video_depth", "portrait_blur"} else NATIVE_PIXEL_FORMATS
+    effect_formats = NATIVE_PIXEL_FORMATS
     compatible_modes = [
         mode for mode in camera_info.modes
         if (mode.pixel_format in NATIVE_PIXEL_FORMATS or mode.pixel_format == "MJPG")
@@ -240,9 +262,7 @@ def main() -> int:
     )
     input_width, input_height = selected_mode.width, selected_mode.height
     input_format = selected_mode.pixel_format
-    output_format = args.pixel_format or (
-        "RGB3" if args.effect in {"video_depth", "portrait_blur"} else ("YUYV" if input_format == "MJPG" else input_format)
-    )
+    output_format = args.pixel_format or ("YUYV" if input_format == "MJPG" else input_format)
     fps = args.fps if args.fps is not None else 30.0
     if args.out_size is not None and args.out_size != (input_width, input_height):
         parser.error("Input and output resolutions must match; set --in-size and --out-size to the same WxH")

@@ -24,7 +24,7 @@ LinuxStudioEffects/
 Effects are grouped by behavior under `video/effects/<effect>/`. A backend is
 implemented only when its file exists (`cpu.py`, `gpu.py`, or `npu.py`); use
 `available_effect_backends()` to inspect the catalog and `load_effect_backend()`
-to import a backend lazily. `create_effect("video_depth")` selects the best
+to import a backend lazily. `create_effect("portrait_blur")` selects the best
 implemented backend available on the host (NPU, then GPU, then CPU). Shared
 model code remains under `video/models/`.
 

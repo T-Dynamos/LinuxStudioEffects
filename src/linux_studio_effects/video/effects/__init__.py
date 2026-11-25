@@ -31,7 +31,6 @@ _LAZY_EFFECTS = {
     "PassthroughEffect": ("passthrough.cpu", "PassthroughEffect"),
     "PortraitBlurEffect": ("portrait_blur.cpu", "PortraitBlurEffect"),
     "SpotlightEffect": ("spotlight.cpu", "SpotlightEffect"),
-    "VideoDepthEffect": ("video_depth.cpu", "VideoDepthEffect"),
     "ZoomCropEffect": ("zoom_crop.cpu", "ZoomCropEffect"),
 }
 
@@ -48,10 +47,7 @@ BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "spotlight": _factory("spotlight"),
     "blur": _factory("fast_blur"),
     "greyscale": _factory("greyscale"),
-    "depth_cpu": _factory("video_depth", "cpu"),
-    "depth_npu": _factory("video_depth", "npu"),
-    "video_depth_cpu": _factory("video_depth", "cpu"),
-    "video_depth_npu": _factory("video_depth", "npu"),
+    "portrait_blur": _factory("portrait_blur"),
     "portrait_blur_cpu": _factory("portrait_blur", "cpu"),
     "portrait_blur_npu": _factory("portrait_blur", "npu"),
 }
@@ -91,7 +87,6 @@ __all__ = [
     "PassthroughEffect",
     "SpotlightEffect",
     "ZoomCropEffect",
-    "VideoDepthEffect",
     "as_frame_effect",
     "is_device_available",
     "resolve_compute_device",

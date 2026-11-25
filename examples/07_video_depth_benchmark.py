@@ -11,6 +11,8 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from linux_studio_effects.video import (
+    FrameContext,
+    FrameEffect,
     PipelineConfig,
     V4L2Camera,
     VideoPipeline,
@@ -18,14 +20,15 @@ from linux_studio_effects.video import (
     pick_default_camera,
     pick_default_loopback,
 )
-from linux_studio_effects.video.effects.video_depth.npu import VideoDepthEffect
 from linux_studio_effects.video.models.video_depth_anything import (
     VideoDepthAnythingModel,
     create_synthetic_weights,
+    depth_to_colormap_rgb,
     format_feasibility_table,
     get_video_depth_config,
     load_from_hf,
 )
+from linux_studio_effects.video.pixels import model_luma_input
 
 
 def _load_sample_rgb(width: int = 640, height: int = 480) -> np.ndarray:
@@ -134,13 +137,49 @@ def main() -> int:
         if loopback is None:
             print("No v4l2loopback device found for --live mode.", file=sys.stderr)
             return 1
-        eff = VideoDepthEffect(
+
+        class _DepthPreviewEffect(FrameEffect):
+            def __init__(self, variant: str, input_size: int, use_real_weights: bool) -> None:
+                super().__init__(name="depth_preview", device="npu")
+                self._cfg = get_video_depth_config(variant, input_size=input_size)
+                self._use_real = use_real_weights
+                self._model: VideoDepthAnythingModel | None = None
+
+            def setup(self, width: int, height: int, fps: float) -> None:
+                super().setup(width, height, fps)
+                if self._model is None:
+                    w = load_from_hf(self._cfg) if self._use_real else create_synthetic_weights(self._cfg)
+                    self._model = VideoDepthAnythingModel(self._cfg, w, backend="npu")
+                else:
+                    self._model.reset_temporal_state()
+
+            def process(self, frame: np.ndarray, ctx: FrameContext | None = None) -> np.ndarray:
+                assert self._model is not None
+                fmt = ctx.pixel_format if ctx else "RGB3"
+                res = self._model.infer(model_luma_input(frame, fmt))
+                h = frame.shape[0]
+                w = ctx.width if ctx else frame.shape[1]
+                return depth_to_colormap_rgb(res.depth, out_width=w, out_height=h)
+
+            def teardown(self) -> None:
+                if self._model is not None:
+                    self._model.close()
+                    self._model = None
+                super().teardown()
+
+        eff = _DepthPreviewEffect(
             variant=args.variants[0],
             input_size=args.input_size,
             use_real_weights=args.real_weights or (args.variants[0] == "small"),
         )
         pipe = VideoPipeline(
-            PipelineConfig(output_device=loopback.path, output_width=640, output_height=480),
+            PipelineConfig(
+                input_format="RGB3",
+                output_device=loopback.path,
+                output_width=640,
+                output_height=480,
+                output_format="RGB3",
+            ),
             effect=eff,
         )
         print(f"\nStreaming live NPU Video Depth Anything ({args.variants[0]} @ {args.input_size}x{args.input_size}) -> {loopback.path}")

@@ -52,15 +52,15 @@ Run any example from the repository root using `.ironenv/bin/python` (or Python 
    ./.ironenv/bin/python examples/08_live_video_depth_side_by_side.py --input-size 140 --preview
    ```
 
-9. **[09_run_effect.py](09_run_effect.py)** — Run any discovered effect/backend on the live camera using an advertised native 1920x1080 mode at 30 fps by default. Input and output sizes must match; use `--in-size` (and the same `--out-size`, if supplied) to choose another advertised native size. A missing `/dev/videoN` output is created for this run, assigned to the invoking user, and removed on exit; module changes may prompt for `sudo`. Use `--list` to inspect effect folders, or `--frames 5` for an optional synthetic-frame check. Depth effects use synthetic weights unless `--real-weights` is given.
+9. **[09_run_effect.py](09_run_effect.py)** — Run any discovered effect/backend on the live camera using an advertised native 1920x1080 mode at 30 fps by default. Input and output sizes must match; use `--in-size` (and the same `--out-size`, if supplied) to choose another advertised native size. A missing `/dev/videoN` output is created for this run, assigned to the invoking user, and removed on exit; module changes may prompt for `sudo`. Use `--list` to inspect effect folders, or `--frames 5` for an optional synthetic-frame check. Live `portrait_blur` uses real depth weights by default (pass `--synthetic-weights` to override).
    ```bash
    ./.ironenv/bin/python examples/09_run_effect.py --list
    ./.ironenv/bin/python examples/09_run_effect.py --effect mirror
    ./.ironenv/bin/python examples/09_run_effect.py --effect mirror --in-size 1920x1080 --out-size 1920x1080
-   ./.ironenv/bin/python examples/09_run_effect.py --effect video_depth --device auto
+   ./.ironenv/bin/python examples/09_run_effect.py --effect portrait_blur --device cpu
    ```
 
-10. **[10_benchmark_effect_backends.py](10_benchmark_effect_backends.py)** — Benchmark each discovered effect/backend on real camera frames. Depth effects use RGB3 modes; other effects use a matching native camera mode. Depth weights are synthetic by default.
+10. **[10_benchmark_effect_backends.py](10_benchmark_effect_backends.py)** — Benchmark each discovered effect/backend on real camera frames using a matching native camera mode (or MJPG decoded via PyAV). Portrait blur uses synthetic depth weights by default unless `--real-weights` is passed.
     ```bash
     ./.ironenv/bin/python examples/10_benchmark_effect_backends.py --duration 3
     ```

@@ -22,7 +22,7 @@ from linux_studio_effects.video import (
 )
 from linux_studio_effects.video.pixels import NATIVE_PIXEL_FORMATS
 
-_MODEL_EFFECTS = frozenset(("video_depth", "portrait_blur"))
+_MODEL_EFFECTS = frozenset(("portrait_blur",))
 
 
 def _size(value: str) -> tuple[int, int]:
@@ -36,9 +36,7 @@ def _size(value: str) -> tuple[int, int]:
 
 
 def _best_mode(info, effect_name: str, pixel_format: str | None, size: tuple[int, int] | None):
-    formats = ("RGB3",) if effect_name in _MODEL_EFFECTS else NATIVE_PIXEL_FORMATS
-    if effect_name in _MODEL_EFFECTS and pixel_format not in (None, "RGB3"):
-        return None
+    formats = NATIVE_PIXEL_FORMATS
     modes = [
         mode
         for mode in info.modes
@@ -72,11 +70,7 @@ def _benchmark_one(
 ) -> None:
     effect = None
     try:
-        process_format = (
-            "RGB3"
-            if effect_name in _MODEL_EFFECTS
-            else (pixel_format or ("YUYV" if mode.pixel_format == "MJPG" else mode.pixel_format))
-        )
+        process_format = pixel_format or ("YUYV" if mode.pixel_format == "MJPG" else mode.pixel_format)
         options: dict[str, object] = {}
         if effect_name in _MODEL_EFFECTS:
             options.update(
@@ -201,7 +195,7 @@ def main() -> int:
     for effect_name, backends in catalog.items():
         mode = _best_mode(info, effect_name, args.pixel_format, args.size)
         if mode is None:
-            expected_formats = "RGB3" if effect_name in _MODEL_EFFECTS else ", ".join(NATIVE_PIXEL_FORMATS)
+            expected_formats = ", ".join(NATIVE_PIXEL_FORMATS)
             for backend in backends:
                 print(
                     f"{effect_name:16s} {backend:4s} SKIPPED: no raw mode in ({expected_formats}) "

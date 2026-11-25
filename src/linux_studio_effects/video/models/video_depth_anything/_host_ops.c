@@ -672,3 +672,247 @@ void im2col_3x3_s1_p1_f32(
         memset(d8 + (H - 1) * W, 0, w_bytes);
     }
 }
+
+void downsample2x_bg_hw4_f32(
+    const uint8_t *frame_u8,
+    const float *w0,
+    float *out_hw4,
+    int in_h,
+    int in_w
+) {
+    const int out_h = (in_h + 1) >> 1;
+    const int out_w = (in_w + 1) >> 1;
+    for (int oy = 0; oy < out_h; ++oy) {
+        const int y0 = oy * 2;
+        const int y1 = (y0 + 1 < in_h) ? (y0 + 1) : y0;
+        const uint8_t *f_row0 = frame_u8 + (size_t)y0 * (size_t)in_w * 3;
+        const uint8_t *f_row1 = frame_u8 + (size_t)y1 * (size_t)in_w * 3;
+        const float *w_row0 = w0 + (size_t)y0 * (size_t)in_w;
+        const float *w_row1 = w0 + (size_t)y1 * (size_t)in_w;
+        float *dst = out_hw4 + (size_t)oy * (size_t)out_w * 4;
+
+        for (int ox = 0; ox < out_w; ++ox) {
+            const int x0 = ox * 2;
+            const int x1 = (x0 + 1 < in_w) ? (x0 + 1) : x0;
+            const float wa = w_row0[x0];
+            const float wb = w_row0[x1];
+            const float wc = w_row1[x0];
+            const float wd = w_row1[x1];
+
+            const uint8_t *pa = f_row0 + (size_t)x0 * 3;
+            const uint8_t *pb = f_row0 + (size_t)x1 * 3;
+            const uint8_t *pc = f_row1 + (size_t)x0 * 3;
+            const uint8_t *pd = f_row1 + (size_t)x1 * 3;
+
+            dst[ox * 4 + 0] = 0.25f * ((float)pa[0] * wa + (float)pb[0] * wb + (float)pc[0] * wc + (float)pd[0] * wd);
+            dst[ox * 4 + 1] = 0.25f * ((float)pa[1] * wa + (float)pb[1] * wb + (float)pc[1] * wc + (float)pd[1] * wd);
+            dst[ox * 4 + 2] = 0.25f * ((float)pa[2] * wa + (float)pb[2] * wb + (float)pc[2] * wc + (float)pd[2] * wd);
+            dst[ox * 4 + 3] = 0.25f * (wa + wb + wc + wd);
+        }
+    }
+}
+
+int bilinear_resize_hwc_f32_to_u8(
+    const float *x,
+    uint8_t *out,
+    int in_h,
+    int in_w,
+    int out_h,
+    int out_w
+) {
+    if (in_h <= 0 || in_w <= 0 || out_h <= 0 || out_w <= 0) {
+        return -1;
+    }
+
+    size_t int_count = (size_t)out_w * 2 + (size_t)out_h * 2;
+    size_t flt_count = (size_t)out_w * 7 + (size_t)out_h;
+    int32_t *ibuf = (int32_t *)malloc(int_count * sizeof(int32_t));
+    float *fbuf = (float *)malloc(flt_count * sizeof(float));
+    if (!ibuf || !fbuf) {
+        free(ibuf);
+        free(fbuf);
+        return -1;
+    }
+
+    int32_t *x0 = ibuf;
+    int32_t *x1 = x0 + out_w;
+    int32_t *y0 = x1 + out_w;
+    int32_t *y1 = y0 + out_h;
+
+    float *wx = fbuf;
+    float *wy = wx + out_w;
+    float *row_a = wy + out_h;
+    float *row_b = row_a + (size_t)out_w * 3;
+
+    if (in_w == 1 || out_w == 1) {
+        for (int i = 0; i < out_w; ++i) {
+            x0[i] = 0;
+            x1[i] = 0;
+            wx[i] = 0.0f;
+        }
+    } else {
+        float scale = (float)((double)in_w / (double)out_w);
+        for (int i = 0; i < out_w; ++i) {
+            float prod = ((float)i + 0.5f) * scale;
+            __asm__("" : "+x"(prod));
+            float xc = prod - 0.5f;
+            if (xc < 0.0f) xc = 0.0f;
+            if (xc > (float)(in_w - 1)) xc = (float)(in_w - 1);
+            int i0 = (int)floorf(xc);
+            int i1 = (i0 + 1 < in_w) ? i0 + 1 : in_w - 1;
+            x0[i] = i0;
+            x1[i] = i1;
+            wx[i] = xc - (float)i0;
+        }
+    }
+
+    if (in_h == 1 || out_h == 1) {
+        for (int i = 0; i < out_h; ++i) {
+            y0[i] = 0;
+            y1[i] = 0;
+            wy[i] = 0.0f;
+        }
+    } else {
+        float scale = (float)((double)in_h / (double)out_h);
+        for (int i = 0; i < out_h; ++i) {
+            float prod = ((float)i + 0.5f) * scale;
+            __asm__("" : "+x"(prod));
+            float yc = prod - 0.5f;
+            if (yc < 0.0f) yc = 0.0f;
+            if (yc > (float)(in_h - 1)) yc = (float)(in_h - 1);
+            int i0 = (int)floorf(yc);
+            int i1 = (i0 + 1 < in_h) ? i0 + 1 : in_h - 1;
+            y0[i] = i0;
+            y1[i] = i1;
+            wy[i] = yc - (float)i0;
+        }
+    }
+
+    const int out_w3 = out_w * 3;
+    const size_t in_stride = (size_t)in_w * 3;
+    int cached_id[2] = {-1, -1};
+    float *slots[2] = {row_a, row_b};
+    const __m512 vzero = _mm512_setzero_ps();
+    const __m512 v255 = _mm512_set1_ps(255.0f);
+
+    for (int oy = 0; oy < out_h; ++oy) {
+        const int r0 = y0[oy];
+        const int r1 = y1[oy];
+        const float wyv = wy[oy];
+
+        float *p0;
+        if (r0 == cached_id[0]) {
+            p0 = slots[0];
+        } else if (r0 == cached_id[1]) {
+            p0 = slots[1];
+        } else {
+            int slot = (cached_id[0] == r1) ? 1 : 0;
+            const float *in_row = x + (size_t)r0 * in_stride;
+            float *dst = slots[slot];
+            for (int ox = 0; ox < out_w; ++ox) {
+                const float *s0 = in_row + (size_t)x0[ox] * 3;
+                const float *s1 = in_row + (size_t)x1[ox] * 3;
+                const float w = wx[ox];
+                dst[ox * 3 + 0] = s0[0] + w * (s1[0] - s0[0]);
+                dst[ox * 3 + 1] = s0[1] + w * (s1[1] - s0[1]);
+                dst[ox * 3 + 2] = s0[2] + w * (s1[2] - s0[2]);
+            }
+            cached_id[slot] = r0;
+            p0 = slots[slot];
+        }
+
+        uint8_t *out_row = out + (size_t)oy * (size_t)out_w3;
+        if (r1 == r0 || wyv == 0.0f) {
+            int k = 0;
+            for (; k + 16 <= out_w3; k += 16) {
+                __m512 vf = _mm512_loadu_ps(p0 + k);
+                vf = _mm512_min_ps(_mm512_max_ps(vf, vzero), v255);
+                __m512i vi = _mm512_cvtps_epi32(
+                    _mm512_roundscale_ps(vf, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)
+                );
+                _mm_storeu_si128((__m128i *)(out_row + k), _mm512_cvtusepi32_epi8(vi));
+            }
+            for (; k < out_w3; ++k) {
+                float v = p0[k];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 255.0f) v = 255.0f;
+                out_row[k] = (uint8_t)lrintf(v);
+            }
+            continue;
+        }
+
+        float *p1;
+        if (r1 == cached_id[0]) {
+            p1 = slots[0];
+        } else if (r1 == cached_id[1]) {
+            p1 = slots[1];
+        } else {
+            int slot = (p0 == slots[0]) ? 1 : 0;
+            const float *in_row = x + (size_t)r1 * in_stride;
+            float *dst = slots[slot];
+            for (int ox = 0; ox < out_w; ++ox) {
+                const float *s0 = in_row + (size_t)x0[ox] * 3;
+                const float *s1 = in_row + (size_t)x1[ox] * 3;
+                const float w = wx[ox];
+                dst[ox * 3 + 0] = s0[0] + w * (s1[0] - s0[0]);
+                dst[ox * 3 + 1] = s0[1] + w * (s1[1] - s0[1]);
+                dst[ox * 3 + 2] = s0[2] + w * (s1[2] - s0[2]);
+            }
+            cached_id[slot] = r1;
+            p1 = slots[slot];
+        }
+
+        const __m512 vwy = _mm512_set1_ps(wyv);
+        int k = 0;
+        for (; k + 16 <= out_w3; k += 16) {
+            __m512 va = _mm512_loadu_ps(p0 + k);
+            __m512 vb = _mm512_loadu_ps(p1 + k);
+            __m512 vf = _mm512_fmadd_ps(vwy, _mm512_sub_ps(vb, va), va);
+            vf = _mm512_min_ps(_mm512_max_ps(vf, vzero), v255);
+            __m512i vi = _mm512_cvtps_epi32(
+                _mm512_roundscale_ps(vf, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)
+            );
+            _mm_storeu_si128((__m128i *)(out_row + k), _mm512_cvtusepi32_epi8(vi));
+        }
+        for (; k < out_w3; ++k) {
+            float v = p0[k] + wyv * (p1[k] - p0[k]);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 255.0f) v = 255.0f;
+            out_row[k] = (uint8_t)lrintf(v);
+        }
+    }
+
+    free(ibuf);
+    free(fbuf);
+    return 0;
+}
+
+void bokeh_composite_u8(
+    const uint8_t *l0,
+    const uint8_t *l1,
+    const uint8_t *l2,
+    const uint8_t *l3,
+    const uint8_t *coc_u8,
+    uint8_t *out,
+    int64_t num_pixels
+) {
+    for (int64_t i = 0; i < num_pixels; ++i) {
+        int32_t c = (int32_t)coc_u8[i];
+        int32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+        if (c < 85) {
+            w1 = c * 3;
+            w0 = 256 - w1;
+        } else if (c < 170) {
+            w2 = (c - 85) * 3;
+            w1 = 256 - w2;
+        } else {
+            int32_t d = c - 170;
+            w3 = d * 3 + (d >> 6);
+            w2 = 256 - w3;
+        }
+        const int64_t idx = i * 3;
+        out[idx + 0] = (uint8_t)((128 + l0[idx + 0] * w0 + l1[idx + 0] * w1 + l2[idx + 0] * w2 + l3[idx + 0] * w3) >> 8);
+        out[idx + 1] = (uint8_t)((128 + l0[idx + 1] * w0 + l1[idx + 1] * w1 + l2[idx + 1] * w2 + l3[idx + 1] * w3) >> 8);
+        out[idx + 2] = (uint8_t)((128 + l0[idx + 2] * w0 + l1[idx + 2] * w1 + l2[idx + 2] * w2 + l3[idx + 2] * w3) >> 8);
+    }
+}

@@ -5,7 +5,6 @@ from .config import VideoDepthConfig, get_video_depth_config
 from .feasibility import FeasibilityReport, analyze_feasibility, format_feasibility_table
 from .model import InferenceResult, VideoDepthAnythingModel
 from .npu_ops import NPU_DISPATCH_LOCK, NpuExecStats, NpuMatMulExecutor
-from .portrait_blur import PortraitBlurEffectBase
 from .weights import (
     VideoDepthWeights,
     create_synthetic_weights,
@@ -19,7 +18,6 @@ __all__ = [
     "NPU_DISPATCH_LOCK",
     "NpuExecStats",
     "NpuMatMulExecutor",
-    "PortraitBlurEffectBase",
     "TURBO_LUT",
     "VideoDepthAnythingModel",
     "VideoDepthConfig",

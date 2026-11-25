@@ -59,7 +59,6 @@ _LAZY_EFFECT_EXPORTS = {
     "PassthroughEffect",
     "PortraitBlurEffect",
     "SpotlightEffect",
-    "VideoDepthEffect",
     "ZoomCropEffect",
 }
 
@@ -100,7 +99,6 @@ __all__ = [
     "GreyscaleEffect",
     "MirrorEffect",
     "PortraitBlurEffect",
-    "VideoDepthEffect",
     "PassthroughEffect",
     "PipelineConfig",
     "PipelineStats",

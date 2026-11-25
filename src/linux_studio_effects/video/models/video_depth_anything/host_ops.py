@@ -28,6 +28,7 @@ _COMPILE_FLAGS = [
 
 _C_FLOAT_PTR = ctypes.POINTER(ctypes.c_float)
 _C_U16_PTR = ctypes.POINTER(ctypes.c_uint16)
+_C_U8_PTR = ctypes.POINTER(ctypes.c_uint8)
 
 _TLS = threading.local()
 
@@ -178,6 +179,36 @@ def _load_c_lib() -> ctypes.CDLL | None:
     ]
     lib.im2col_3x3_s1_p1_f32.restype = None
 
+    lib.downsample2x_bg_hw4_f32.argtypes = [
+        _C_U8_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.downsample2x_bg_hw4_f32.restype = None
+
+    lib.bilinear_resize_hwc_f32_to_u8.argtypes = [
+        _C_FLOAT_PTR,
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.bilinear_resize_hwc_f32_to_u8.restype = ctypes.c_int
+
+    lib.bokeh_composite_u8.argtypes = [
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        ctypes.c_int64,
+    ]
+    lib.bokeh_composite_u8.restype = None
+
     return lib
 
 
@@ -195,6 +226,10 @@ def _ptr_f32(arr: np.ndarray) -> ctypes.POINTER(ctypes.c_float):
 
 def _ptr_u16(arr: np.ndarray) -> ctypes.POINTER(ctypes.c_uint16):
     return arr.ctypes.data_as(_C_U16_PTR)
+
+
+def _ptr_u8(arr: np.ndarray) -> ctypes.POINTER(ctypes.c_uint8):
+    return arr.ctypes.data_as(_C_U8_PTR)
 
 
 def _get_im2col_scratch(rows: int, cols: int) -> np.ndarray:
@@ -513,3 +548,82 @@ def conv2d_3x3_s1_p1(
     if bias is not None:
         out += np.ascontiguousarray(bias, dtype=np.float32).reshape(1, c_out, 1, 1)
     return out
+
+
+def downsample2x_bg_hw4(frame_u8: np.ndarray, w0: np.ndarray) -> np.ndarray:
+    """Premultiply uint8 (H, W, 3) by background mask w0 and downsample 2x into (ceil(H/2), ceil(W/2), 4)."""
+    h, w, c = frame_u8.shape
+    if c != 3:
+        raise ValueError(f"Expected (H, W, 3) frame, got {frame_u8.shape}")
+    out_h, out_w = (h + 1) // 2, (w + 1) // 2
+    if _LIB is not None:
+        f_c = np.ascontiguousarray(frame_u8, dtype=np.uint8)
+        w_c = np.ascontiguousarray(w0, dtype=np.float32)
+        out = np.empty((out_h, out_w, 4), dtype=np.float32)
+        _LIB.downsample2x_bg_hw4_f32(_ptr_u8(f_c), _ptr_f32(w_c), _ptr_f32(out), h, w)
+        return out
+
+    cur = np.empty((h, w, 4), dtype=np.float32)
+    cur[:, :, :3] = frame_u8.astype(np.float32) * w0[:, :, None]
+    cur[:, :, 3] = w0
+    pad_h = h & 1
+    pad_w = w & 1
+    if pad_h or pad_w:
+        cur = np.pad(cur, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    return np.float32(0.25) * (cur[0::2, 0::2] + cur[0::2, 1::2] + cur[1::2, 0::2] + cur[1::2, 1::2])
+
+
+def bilinear_resize_hwc_u8_fast(arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray | None:
+    """Fast C/AVX-512 bilinear resize of float32 (H, W, 3) to uint8 (out_h, out_w, 3), or None if unavailable."""
+    if _LIB is None:
+        return None
+    in_h, in_w, c = arr.shape
+    if c != 3:
+        raise ValueError(f"Expected (H, W, 3) array, got {arr.shape}")
+    arr_c = np.ascontiguousarray(arr, dtype=np.float32)
+    out = np.empty((out_h, out_w, 3), dtype=np.uint8)
+    rc = _LIB.bilinear_resize_hwc_f32_to_u8(_ptr_f32(arr_c), _ptr_u8(out), in_h, in_w, out_h, out_w)
+    return out if rc == 0 else None
+
+
+def bokeh_composite_u8(
+    l0: np.ndarray,
+    l1: np.ndarray,
+    l2: np.ndarray,
+    l3: np.ndarray,
+    coc_u8: np.ndarray,
+) -> np.ndarray:
+    """Fixed-point 4-level portrait bokeh blend matching the AIE2 NPU kernel bit-for-bit."""
+    if _LIB is not None:
+        l0_c = np.ascontiguousarray(l0, dtype=np.uint8)
+        l1_c = np.ascontiguousarray(l1, dtype=np.uint8)
+        l2_c = np.ascontiguousarray(l2, dtype=np.uint8)
+        l3_c = np.ascontiguousarray(l3, dtype=np.uint8)
+        coc_c = np.ascontiguousarray(coc_u8, dtype=np.uint8)
+        out = np.empty_like(l0_c)
+        _LIB.bokeh_composite_u8(
+            _ptr_u8(l0_c),
+            _ptr_u8(l1_c),
+            _ptr_u8(l2_c),
+            _ptr_u8(l3_c),
+            _ptr_u8(coc_c),
+            _ptr_u8(out),
+            coc_c.size,
+        )
+        return out
+
+    # uint16 is exact because sum(w_i) == 256 and max(l_i) == 255 -> max sum == 65408 <= 65535.
+    c = coc_u8.astype(np.uint16)
+    d2 = np.maximum(c, 170) - 170
+    t2 = d2 * 3 + (d2 >> 6)
+    w0 = np.where(c < 85, 256 - c * 3, 0)[:, :, None].astype(np.uint16)
+    w1 = np.where(c < 85, c * 3, np.where(c < 170, 256 - (np.maximum(c, 85) - 85) * 3, 0))[:, :, None].astype(np.uint16)
+    w2 = np.where((c >= 85) & (c < 170), (np.maximum(c, 85) - 85) * 3, np.where(c >= 170, 256 - t2, 0))[:, :, None].astype(np.uint16)
+    w3 = np.where(c >= 170, t2, 0)[:, :, None].astype(np.uint16)
+    acc = l0.astype(np.uint16) * w0
+    acc += l1.astype(np.uint16) * w1
+    acc += l2.astype(np.uint16) * w2
+    acc += l3.astype(np.uint16) * w3
+    acc += 128
+    acc >>= 8
+    return np.ascontiguousarray(acc.astype(np.uint8))

@@ -31,3 +31,8 @@ Run any example from the repository root using `iron-env/bin/python` (or any Pyt
      --out-size 640x480 --out-fps 30
    ```
    While it runs, view the virtual webcam from any app (or `ffplay /dev/video4`).
+
+5. **[05_frame_effect_pipeline.py](05_frame_effect_pipeline.py)** — Device-agnostic frame-in -> frame-out -> virtual camera demo combining `FrameEffect` subclasses, plain Python `fn(frame) -> frame` callables, and `EffectChain`.
+   ```bash
+   ./iron-env/bin/python examples/05_frame_effect_pipeline.py --effect studio_demo
+   ```

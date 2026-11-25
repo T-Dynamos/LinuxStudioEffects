@@ -12,9 +12,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from .camera import CameraConfig, V4L2Camera
+from .effects import BUILTIN_EFFECTS, EffectChain, FrameContext, FrameEffect, as_frame_effect
 from .virtual_cam import VirtualCameraConfig, VirtualCameraOutput, resize_rgb
 
-FrameProcessor = Callable[[np.ndarray], np.ndarray]
+FrameProcessor = FrameEffect | Callable[[np.ndarray], np.ndarray]
 StatsCallback = Callable[["PipelineStats"], None]
 
 
@@ -59,12 +60,23 @@ class VideoPipeline:
         config: PipelineConfig | None = None,
         *,
         frame_processor: FrameProcessor | None = None,
+        effect: FrameEffect | list[FrameProcessor] | tuple[FrameProcessor, ...] | None = None,
     ) -> None:
         self._config = config or PipelineConfig()
-        self._processor = frame_processor
+        chosen = effect if effect is not None else frame_processor
+        if chosen is None:
+            self._effect: FrameEffect | None = None
+        elif isinstance(chosen, (list, tuple)):
+            self._effect = EffectChain(chosen)
+        else:
+            self._effect = as_frame_effect(chosen)
         self._stop_event = threading.Event()
         self._negotiated_in: CameraConfig | None = None
         self._negotiated_out: VirtualCameraConfig | None = None
+
+    @property
+    def effect(self) -> FrameEffect | None:
+        return self._effect
 
     @property
     def negotiated_input(self) -> CameraConfig | None:
@@ -109,6 +121,9 @@ class VideoPipeline:
             self._negotiated_in = cam.negotiated
             self._negotiated_out = vcam.negotiated
 
+            if self._effect is not None:
+                self._effect.setup(cam.negotiated.width, cam.negotiated.height, cam.negotiated.fps)
+
             wall_start = time.monotonic()
             cpu_start = time.process_time()
             last_report_wall = wall_start
@@ -141,7 +156,17 @@ class VideoPipeline:
 
                     if should_emit and frame.data is not None:
                         t0 = time.perf_counter()
-                        out_rgb = self._processor(frame.data) if self._processor is not None else frame.data
+                        if self._effect is not None and self._effect.enabled:
+                            ctx = FrameContext(
+                                frame_index=frames_in,
+                                timestamp_s=frame.driver_timestamp_s,
+                                width=frame.width,
+                                height=frame.height,
+                                fps=cam.negotiated.fps,
+                            )
+                            out_rgb = self._effect.process(frame.data, ctx)
+                        else:
+                            out_rgb = frame.data
                         if out_rgb.shape[1] != vcam.negotiated.width or out_rgb.shape[0] != vcam.negotiated.height:
                             out_rgb = resize_rgb(
                                 out_rgb,
@@ -182,6 +207,9 @@ class VideoPipeline:
                         last_report_out = frames_out
             except KeyboardInterrupt:
                 self._stop_event.set()
+            finally:
+                if self._effect is not None:
+                    self._effect.teardown()
 
             total_wall = max(time.monotonic() - wall_start, 1e-9)
             total_cpu = max(time.process_time() - cpu_start, 0.0)
@@ -217,6 +245,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-format", default="YUYV", help="Output FourCC: YUYV, RGB3, BGR3 (default: YUYV)")
     parser.add_argument("--out-fps", type=float, default=30.0, help="Output FPS (default: 30)")
     parser.add_argument("--resize-mode", choices=("cover", "stretch"), default="cover")
+    parser.add_argument(
+        "--effect",
+        choices=tuple(BUILTIN_EFFECTS.keys()),
+        default="none",
+        help="Built-in CPU frame effect to apply (default: none)",
+    )
     parser.add_argument("--duration", type=float, default=0.0, help="Run duration in seconds (0 = until Ctrl+C)")
     args = parser.parse_args(argv)
 
@@ -233,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         output_fps=args.out_fps,
         resize_mode=args.resize_mode,
     )
-    pipe = VideoPipeline(cfg)
+    pipe = VideoPipeline(cfg, effect=BUILTIN_EFFECTS[args.effect]())
 
     def _print_tick(st: PipelineStats) -> None:
         print(

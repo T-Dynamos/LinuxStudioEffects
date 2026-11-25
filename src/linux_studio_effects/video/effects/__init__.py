@@ -1,8 +1,11 @@
-"""Video frame effects organized by effect, with optional backend modules."""
+"""Video effect interfaces and lazy exports for concrete effect backends."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from importlib import import_module
+from typing import Any
+
 from ..backend import (
     available_effect_backends,
     create_effect,
@@ -20,29 +23,54 @@ from .base import (
     FrameEffect,
     as_frame_effect,
 )
-from .fast_blur.cpu import FastBlurEffect
-from .greyscale.npu import GreyscaleEffect
-from .mirror.cpu import MirrorEffect
-from .passthrough.cpu import PassthroughEffect
-from .portrait_blur.cpu import PortraitBlurEffect
-from .spotlight.cpu import SpotlightEffect
-from .video_depth.cpu import VideoDepthEffect
-from .zoom_crop.cpu import ZoomCropEffect
+
+_LAZY_EFFECTS = {
+    "FastBlurEffect": ("fast_blur.cpu", "FastBlurEffect"),
+    "GreyscaleEffect": ("greyscale.npu", "GreyscaleEffect"),
+    "MirrorEffect": ("mirror.cpu", "MirrorEffect"),
+    "PassthroughEffect": ("passthrough.cpu", "PassthroughEffect"),
+    "PortraitBlurEffect": ("portrait_blur.cpu", "PortraitBlurEffect"),
+    "SpotlightEffect": ("spotlight.cpu", "SpotlightEffect"),
+    "VideoDepthEffect": ("video_depth.cpu", "VideoDepthEffect"),
+    "ZoomCropEffect": ("zoom_crop.cpu", "ZoomCropEffect"),
+}
+
+
+def _factory(effect_name: str, device: str = "auto") -> Callable[[], FrameEffect]:
+    """Defer backend resolution and effect imports until a preset is selected."""
+    return lambda: create_effect(effect_name, device=device)
+
 
 BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
-    "none": PassthroughEffect,
-    "mirror": MirrorEffect,
-    "zoom": ZoomCropEffect,
-    "spotlight": SpotlightEffect,
-    "blur": FastBlurEffect,
-    "greyscale": lambda: create_effect("greyscale"),
-    "depth_cpu": lambda: create_effect("video_depth", device="cpu"),
-    "depth_npu": lambda: create_effect("video_depth", device="npu"),
-    "video_depth_cpu": lambda: create_effect("video_depth", device="cpu"),
-    "video_depth_npu": lambda: create_effect("video_depth", device="npu"),
-    "portrait_blur_cpu": lambda: create_effect("portrait_blur", device="cpu"),
-    "portrait_blur_npu": lambda: create_effect("portrait_blur", device="npu"),
+    "none": _factory("passthrough"),
+    "mirror": _factory("mirror"),
+    "zoom": _factory("zoom_crop"),
+    "spotlight": _factory("spotlight"),
+    "blur": _factory("fast_blur"),
+    "greyscale": _factory("greyscale"),
+    "depth_cpu": _factory("video_depth", "cpu"),
+    "depth_npu": _factory("video_depth", "npu"),
+    "video_depth_cpu": _factory("video_depth", "cpu"),
+    "video_depth_npu": _factory("video_depth", "npu"),
+    "portrait_blur_cpu": _factory("portrait_blur", "cpu"),
+    "portrait_blur_npu": _factory("portrait_blur", "npu"),
 }
+
+
+def __getattr__(name: str) -> Any:
+    """Import a concrete effect only when its public class is requested."""
+    target = _LAZY_EFFECTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, class_name = target
+    value = getattr(import_module(f".{module_name}", __name__), class_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *_LAZY_EFFECTS})
+
 
 __all__ = [
     "BUILTIN_EFFECTS",

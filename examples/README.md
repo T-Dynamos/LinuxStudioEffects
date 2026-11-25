@@ -1,0 +1,29 @@
+# Examples
+
+Run any example from the repository root using `iron-env/bin/python` (or any Python `>= 3.11` with `numpy` for the camera-only examples):
+
+1. **[01_npu_probe_and_kernel.py](01_npu_probe_and_kernel.py)** — Probe `/dev/accel/accel*`, `amdxdna`, and run a simple `@iron.jit` vector kernel on the AMD Ryzen AI NPU.
+   ```bash
+   ./iron-env/bin/python examples/01_npu_probe_and_kernel.py
+   ```
+
+2. **[02_camera_deps_and_capabilities.py](02_camera_deps_and_capabilities.py)** — Check V4L2/TurboJPEG/`v4l2loopback` dependencies and print a detailed summary of every `/dev/video*` device, supported formats, and controls.
+   ```bash
+   ./iron-env/bin/python examples/02_camera_deps_and_capabilities.py
+   ```
+
+3. **[03_camera_fps_benchmark.py](03_camera_fps_benchmark.py)** — Measure raw V4L2 capture FPS and CPU-decoded RGB FPS at a chosen resolution/format.
+   ```bash
+   ./iron-env/bin/python examples/03_camera_fps_benchmark.py --width 1280 --height 720 --format MJPG --duration 3.0
+   ```
+
+4. **[04_virtual_camera_passthrough.py](04_virtual_camera_passthrough.py)** — Run a live camera -> `v4l2loopback` pipeline with independent input/output resolutions and FPS, reporting throughput and CPU usage %.
+   ```bash
+   # Ensure v4l2loopback is loaded first (creates /dev/video4 or next free node):
+   # sudo modprobe v4l2loopback devices=1 card_label="LinuxStudioEffects" exclusive_caps=1
+
+   ./iron-env/bin/python examples/04_virtual_camera_passthrough.py \
+     --in-size 1280x720 --in-fps 30 \
+     --out-size 640x480 --out-fps 30 --duration 10
+   ```
+   While it runs, view the virtual webcam from any app (or `ffplay /dev/video4`).

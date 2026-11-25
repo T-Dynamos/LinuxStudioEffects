@@ -1,1 +1,76 @@
-"""Video and camera studio effects (stub)."""
+"""Video and camera studio effects capture pipeline."""
+
+from .benchmark import CameraBenchmarkResult, benchmark_camera, format_benchmark_result
+from .camera import CameraConfig, CapturedFrame, V4L2Camera
+from .capabilities import (
+    CameraCapabilitiesSummary,
+    PixelFormatSummary,
+    RecommendedMode,
+    format_all_camera_summaries,
+    format_camera_summary,
+    summarize_all_cameras,
+    summarize_camera_capabilities,
+    summarize_device_capabilities,
+)
+from .decoder import FrameDecoder, decode_yuyv_to_rgb, has_turbojpeg
+from .deps import CameraDepsReport, CheckItem, check_camera_deps, format_deps_report
+from .pipeline import PipelineConfig, PipelineStats, VideoPipeline
+from .v4l2 import (
+    ActiveStreamFormat,
+    VideoControlInfo,
+    VideoDeviceInfo,
+    VideoMode,
+    list_loopback_devices,
+    list_video_devices,
+    pick_default_camera,
+    pick_default_loopback,
+    query_video_device,
+)
+from .virtual_cam import (
+    VirtualCameraConfig,
+    VirtualCameraOutput,
+    encode_rgb_frame,
+    encode_rgb_to_yuyv,
+    resize_rgb,
+)
+
+__all__ = [
+    "ActiveStreamFormat",
+    "CameraBenchmarkResult",
+    "CameraCapabilitiesSummary",
+    "CameraConfig",
+    "CameraDepsReport",
+    "CapturedFrame",
+    "CheckItem",
+    "FrameDecoder",
+    "PipelineConfig",
+    "PipelineStats",
+    "PixelFormatSummary",
+    "RecommendedMode",
+    "V4L2Camera",
+    "VideoControlInfo",
+    "VideoDeviceInfo",
+    "VideoMode",
+    "VideoPipeline",
+    "VirtualCameraConfig",
+    "VirtualCameraOutput",
+    "benchmark_camera",
+    "check_camera_deps",
+    "decode_yuyv_to_rgb",
+    "encode_rgb_frame",
+    "encode_rgb_to_yuyv",
+    "format_all_camera_summaries",
+    "format_benchmark_result",
+    "format_camera_summary",
+    "format_deps_report",
+    "has_turbojpeg",
+    "list_loopback_devices",
+    "list_video_devices",
+    "pick_default_camera",
+    "pick_default_loopback",
+    "query_video_device",
+    "resize_rgb",
+    "summarize_all_cameras",
+    "summarize_camera_capabilities",
+    "summarize_device_capabilities",
+]

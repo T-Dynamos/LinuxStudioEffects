@@ -221,3 +221,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LinuxStudioEffects NPU environment & artifacts
+iron-env/
+ironenv/
+mlir-aie/
+.npu/
+*.xclbin
+*.insts.bin
+*.pdi
+*.elf

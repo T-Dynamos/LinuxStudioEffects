@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..base import ComputeDevice, FrameContext, FrameEffect
+from ...pixels import channels_to_frame, frame_to_channels, is_yuv422
 
 
 class ZoomCropEffect(FrameEffect):
@@ -32,11 +33,17 @@ class ZoomCropEffect(FrameEffect):
     def process(self, frame: np.ndarray, ctx: FrameContext | None = None) -> np.ndarray:
         if self.zoom <= 1.0:
             return frame
-        h, w = frame.shape[:2]
+        pixel_format = ctx.pixel_format if ctx else ("YUYV" if frame.ndim == 3 and frame.shape[2] == 4 else "RGB3")
+        image = frame_to_channels(frame, pixel_format)
+        h, w = image.shape[:2]
+        effect_width = ctx.width if ctx and is_yuv422(pixel_format) else w
         if self._y_idx is None or self._x_idx is None or len(self._y_idx) != h or len(self._x_idx) != w:
-            self.setup(w, h, ctx.fps if ctx else 30.0)
+            self.setup(effect_width, h, ctx.fps if ctx else 30.0)
         assert self._y_idx is not None and self._x_idx is not None
-        return np.ascontiguousarray(frame[self._y_idx[:, None], self._x_idx])
+        if len(self._x_idx) != w:
+            self.setup(effect_width, h, ctx.fps if ctx else 30.0)
+        result = np.ascontiguousarray(image[self._y_idx[:, None], self._x_idx])
+        return channels_to_frame(result, pixel_format)
 
     def teardown(self) -> None:
         self._y_idx = None

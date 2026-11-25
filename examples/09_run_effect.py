@@ -24,6 +24,7 @@ from linux_studio_effects.video import (
     pick_default_camera,
     query_video_device,
 )
+from linux_studio_effects.video.pixels import NATIVE_PIXEL_FORMATS, is_yuv422
 
 
 def _size(value: str) -> tuple[int, int]:
@@ -76,7 +77,15 @@ def _run_privileged(command: list[str]) -> None:
 def _ensure_loopback_device(device: str):
     """Create a missing v4l2loopback node and return its matching cleanup callback."""
     device_path = pathlib.Path(device)
+    def require_accessible() -> None:
+        if not os.access(device, os.R_OK | os.W_OK):
+            raise RuntimeError(
+                f"{device} exists but is not accessible for read/write. Add your user to its owning group "
+                "or adjust the device permissions/udev rule."
+            )
+
     if device_path.exists():
+        require_accessible()
         return None
 
     number = device_path.name.removeprefix("video")
@@ -117,6 +126,15 @@ def _ensure_loopback_device(device: str):
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if device_path.exists():
+            try:
+                owner_uid = int(os.environ.get("SUDO_UID", os.getuid()))
+                owner_gid = int(os.environ.get("SUDO_GID", os.getgid()))
+                _run_privileged(["chown", f"{owner_uid}:{owner_gid}", device])
+                _run_privileged(["chmod", "0600", device])
+                require_accessible()
+            except Exception:
+                cleanup()
+                raise
             print(f"Created temporary v4l2loopback device {device}", flush=True)
             return cleanup
         time.sleep(0.05)
@@ -140,6 +158,11 @@ def main() -> int:
     parser.add_argument("--input-size", type=int, default=140, help="Depth model input size (multiple of 14)")
     parser.add_argument("--real-weights", action="store_true", help="Load real model weights instead of synthetic weights")
     parser.add_argument("--input-device", default="", help="Camera device; default auto-detect")
+    parser.add_argument(
+        "--pixel-format",
+        choices=NATIVE_PIXEL_FORMATS,
+        help="Use this exact uncompressed format for both camera and virtual camera; default selects a shared mode",
+    )
     parser.add_argument(
         "--output-device",
         default="/dev/video4",
@@ -178,30 +201,34 @@ def main() -> int:
     if not camera:
         parser.error("No accessible camera found; use --frames N to run on synthetic frames")
 
-    selected_mode = None
-    if args.in_size is None and camera_info and camera_info.modes:
-        selected_mode = max(
-            camera_info.modes,
-            key=lambda mode: (
-                mode.width * mode.height,
-                mode.pixel_format == "MJPG",
-                max(mode.fps_options, default=0.0),
-            ),
+    effect_formats = ("RGB3",) if args.effect in {"video_depth", "portrait_blur"} else NATIVE_PIXEL_FORMATS
+    compatible_modes = [
+        mode for mode in camera_info.modes
+        if mode.pixel_format in effect_formats
+        and (args.pixel_format is None or mode.pixel_format == args.pixel_format)
+        and (args.in_size is None or (mode.width, mode.height) == args.in_size)
+    ]
+    if not compatible_modes:
+        requested = f" at {args.in_size[0]}x{args.in_size[1]}" if args.in_size else ""
+        parser.error(
+            f"Camera {camera} has no uncompressed mode{requested} shared with the output formats "
+            f"{', '.join(effect_formats)}. Color conversion is disabled."
         )
-    if args.in_size:
-        input_width, input_height = args.in_size
-        input_format = "MJPG"
-        mode_fps = 30.0
-    elif selected_mode is not None:
-        input_width, input_height = selected_mode.width, selected_mode.height
-        input_format = selected_mode.pixel_format
-        mode_fps = max(selected_mode.fps_options, default=30.0)
-    else:
-        input_width, input_height = 1920, 1080
-        input_format = "MJPG"
-        mode_fps = 30.0
+    selected_mode = max(
+        compatible_modes,
+        key=lambda mode: (
+            mode.width * mode.height,
+            max(mode.fps_options, default=0.0),
+            mode.pixel_format == "YUYV",
+        ),
+    )
+    input_width, input_height = selected_mode.width, selected_mode.height
+    input_format = selected_mode.pixel_format
+    mode_fps = max(selected_mode.fps_options, default=30.0)
     fps = args.fps or mode_fps
     output_width, output_height = args.out_size or (input_width, input_height)
+    if is_yuv422(input_format) and output_width % 2:
+        parser.error(f"{input_format} requires an even output width")
 
     config = PipelineConfig(
         input_device=camera,
@@ -211,6 +238,7 @@ def main() -> int:
         output_device=loopback,
         output_width=output_width,
         output_height=output_height,
+        output_format=input_format,
         input_fps=fps,
         output_fps=fps,
     )

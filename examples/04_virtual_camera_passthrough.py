@@ -18,6 +18,7 @@ from linux_studio_effects.video import (
     pick_default_loopback,
     query_video_device,
 )
+from linux_studio_effects.video.pixels import NATIVE_PIXEL_FORMATS
 
 
 def _parse_size(text: str) -> tuple[int, int]:
@@ -34,9 +35,11 @@ def _sorted_modes(dev: VideoDeviceInfo) -> list[tuple[str, int, int, float]]:
     """Return unique (format, width, height, max_fps) modes sorted sensibly."""
     entries: list[tuple[str, int, int, float]] = []
     for m in dev.modes:
+        if m.pixel_format not in NATIVE_PIXEL_FORMATS:
+            continue
         fps = max(m.fps_options) if m.fps_options else 30.0
         entries.append((m.pixel_format, m.width, m.height, fps))
-    fmt_rank = {"MJPG": 0, "YUYV": 1}
+    fmt_rank = {"YUYV": 0, "UYVY": 1, "RGB3": 2, "BGR3": 3}
     return sorted(entries, key=lambda e: (fmt_rank.get(e[0], 2), e[1] * e[2], e[0]))
 
 
@@ -44,11 +47,11 @@ def _prompt_input_mode(dev: VideoDeviceInfo) -> tuple[int, int, str, float]:
     """Prompt user to pick one of the camera's advertised modes (or enter custom)."""
     modes = _sorted_modes(dev)
     if not modes:
-        return 1280, 720, "MJPG", 30.0
+        return 1280, 720, "YUYV", 30.0
 
     default_idx = next(
-        (i for i, (fmt, w, h, _) in enumerate(modes) if fmt == "MJPG" and w == 1280 and h == 720),
-        0,
+        (i for i, (fmt, w, h, _) in enumerate(modes) if fmt == "YUYV" and w == 1280 and h == 720),
+        next((i for i, (fmt, _, _, _) in enumerate(modes) if fmt == "YUYV"), 0),
     )
 
     print(f"\nInput camera: {dev.path} ({dev.card})")
@@ -70,7 +73,7 @@ def _prompt_input_mode(dev: VideoDeviceInfo) -> tuple[int, int, str, float]:
         if "x" in raw.lower():
             try:
                 w, h = _parse_size(raw)
-                return w, h, "MJPG", 30.0
+                return w, h, modes[default_idx][0], 30.0
             except argparse.ArgumentTypeError:
                 pass
         print("  Invalid choice. Enter a number from the list or WxH (e.g. 1280x720).")
@@ -128,11 +131,11 @@ def main() -> int:
     )
     parser.add_argument("--in-device", default="", help="Input camera (default: auto-detect)")
     parser.add_argument("--in-size", type=_parse_size, default=None, help="Input WxH (e.g. 1280x720)")
-    parser.add_argument("--in-format", default=None, help="Input FourCC (e.g. MJPG, YUYV)")
+    parser.add_argument("--in-format", default=None, choices=NATIVE_PIXEL_FORMATS, help="Native input FourCC")
     parser.add_argument("--in-fps", type=float, default=None, help="Input FPS")
     parser.add_argument("--out-device", default="", help="Output v4l2loopback node (default: auto-detect)")
     parser.add_argument("--out-size", type=_parse_size, default=None, help="Output WxH (e.g. 640x480)")
-    parser.add_argument("--out-format", default="YUYV", help="Output FourCC: YUYV, RGB3, BGR3 (default: YUYV)")
+    parser.add_argument("--out-format", default=None, choices=NATIVE_PIXEL_FORMATS, help="Output FourCC; must match input")
     parser.add_argument("--out-fps", type=float, default=None, help="Output FPS")
     parser.add_argument("--resize-mode", choices=("cover", "stretch"), default="cover")
     parser.add_argument("--duration", type=float, default=0.0, help="Seconds to run (0 = until Ctrl+C)")
@@ -158,21 +161,42 @@ def main() -> int:
         return 1
 
     interactive = sys.stdin.isatty() and not args.non_interactive
-    needs_in_prompt = interactive and args.in_size is None
+    needs_in_prompt = interactive and args.in_size is None and args.in_format is None
     needs_out_prompt = interactive and args.out_size is None
 
     try:
         if needs_in_prompt:
             in_w, in_h, in_fmt, in_fps = _prompt_input_mode(in_dev)
         else:
-            in_w, in_h = args.in_size or (1280, 720)
-            in_fmt = (args.in_format or "MJPG").upper()
-            in_fps = args.in_fps if args.in_fps is not None else 30.0
+            preferred_fmt = (args.in_format or "YUYV").upper()
+            available = [mode for mode in _sorted_modes(in_dev) if mode[0] == preferred_fmt]
+            if args.in_size:
+                available = [mode for mode in available if (mode[1], mode[2]) == args.in_size]
+            if not available:
+                print(
+                    f"No {preferred_fmt} camera mode matches {args.in_size or 'an available resolution'}; "
+                    "input/output pixel conversion is disabled.",
+                    file=sys.stderr,
+                )
+                return 1
+            selected = max(available, key=lambda mode: (mode[1] * mode[2], mode[3]))
+            in_fmt, default_w, default_h, default_fps = selected
+            in_w, in_h = args.in_size or (default_w, default_h)
+            in_fps = args.in_fps if args.in_fps is not None else default_fps
 
-        if args.in_format is not None:
-            in_fmt = args.in_format.upper()
+        if args.in_format is not None and args.in_format.upper() != in_fmt:
+            print("--in-format must match the selected camera mode", file=sys.stderr)
+            return 1
         if args.in_fps is not None:
             in_fps = args.in_fps
+
+        out_fmt = (args.out_format or in_fmt).upper()
+        if out_fmt != in_fmt:
+            print(
+                f"Input format {in_fmt} differs from output format {out_fmt}; conversion is disabled.",
+                file=sys.stderr,
+            )
+            return 1
 
         if needs_out_prompt:
             out_w, out_h, out_fps = _prompt_output_config(in_w, in_h, in_fps)
@@ -195,7 +219,7 @@ def main() -> int:
         output_device=loopback.path,
         output_width=out_w,
         output_height=out_h,
-        output_format=args.out_format.upper(),
+        output_format=out_fmt,
         output_fps=out_fps,
         resize_mode=args.resize_mode,
     )

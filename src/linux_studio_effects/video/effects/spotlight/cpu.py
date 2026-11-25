@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..base import ComputeDevice, FrameContext, FrameEffect
+from ...pixels import is_yuv422, pack_yuv422, split_yuv422
 
 
 class SpotlightEffect(FrameEffect):
@@ -30,10 +31,16 @@ class SpotlightEffect(FrameEffect):
         self._buf = np.empty((height, width, 3), dtype=np.uint16)
 
     def process(self, frame: np.ndarray, ctx: FrameContext | None = None) -> np.ndarray:
-        h, w = frame.shape[:2]
+        pixel_format = ctx.pixel_format if ctx else ("YUYV" if frame.ndim == 3 and frame.shape[2] == 4 else "RGB3")
+        h = frame.shape[0]
+        w = ctx.width if ctx and is_yuv422(pixel_format) else frame.shape[1]
         if self._mask_q8 is None or self._buf is None or self._buf.shape[:2] != (h, w):
             self.setup(w, h, ctx.fps if ctx else 30.0)
         assert self._mask_q8 is not None and self._buf is not None
+        if is_yuv422(pixel_format):
+            y, u, v = split_yuv422(frame, pixel_format)
+            adjusted_y = ((y.astype(np.uint16) * self._mask_q8[:, :, 0]) >> 8).astype(np.uint8)
+            return pack_yuv422(adjusted_y, u, v, pixel_format)
         np.multiply(frame, self._mask_q8, out=self._buf, dtype=np.uint16)
         self._buf >>= 8
         return self._buf.astype(np.uint8)

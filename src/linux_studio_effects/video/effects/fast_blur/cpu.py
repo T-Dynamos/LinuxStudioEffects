@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..base import ComputeDevice, FrameContext, FrameEffect
+from ...pixels import channels_to_frame, frame_to_channels, is_yuv422
 
 
 class FastBlurEffect(FrameEffect):
@@ -29,12 +30,15 @@ class FastBlurEffect(FrameEffect):
         self._x_up = (np.arange(width, dtype=np.int64) * sw) // width
 
     def process(self, frame: np.ndarray, ctx: FrameContext | None = None) -> np.ndarray:
-        h, w = frame.shape[:2]
-        if self._y_up is None or self._x_up is None or len(self._y_up) != h or len(self._x_up) != w:
-            self.setup(w, h, ctx.fps if ctx else 30.0)
+        pixel_format = ctx.pixel_format if ctx else ("YUYV" if frame.ndim == 3 and frame.shape[2] == 4 else "RGB3")
+        image = frame_to_channels(frame, pixel_format)
+        h, w = image.shape[:2]
+        effect_width = ctx.width if ctx and is_yuv422(pixel_format) else w
+        if self._y_up is None or self._x_up is None or len(self._y_up) != h or len(self._x_up) != effect_width:
+            self.setup(effect_width, h, ctx.fps if ctx else 30.0)
         assert self._y_up is not None and self._x_up is not None
 
-        small = frame[:: self.scale, :: self.scale].astype(np.uint16)
+        small = image[:: self.scale, :: self.scale].astype(np.uint16)
         for _ in range(self.passes):
             # 3-tap horizontal + vertical averaging with edge clamping.
             padded_x = np.pad(small, ((0, 0), (1, 1), (0, 0)), mode="edge")
@@ -42,7 +46,8 @@ class FastBlurEffect(FrameEffect):
             padded_y = np.pad(small, ((1, 1), (0, 0), (0, 0)), mode="edge")
             small = (padded_y[:-2, :] + padded_y[1:-1, :] + padded_y[2:, :]) // 3
         small_u8 = small.astype(np.uint8)
-        return np.ascontiguousarray(small_u8[self._y_up[:, None], self._x_up])
+        result = np.ascontiguousarray(small_u8[self._y_up[:, None], self._x_up])
+        return channels_to_frame(result, pixel_format)
 
     def teardown(self) -> None:
         self._y_up = None

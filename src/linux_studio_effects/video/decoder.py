@@ -8,6 +8,8 @@ import threading
 
 import numpy as np
 
+from .pixels import native_frame
+
 # TurboJPEG constants from <turbojpeg.h>
 _TJPF_RGB = 0
 _TJFLAG_FASTDCT = 2048
@@ -109,7 +111,7 @@ def decode_yuyv_to_rgb(raw: bytes | bytearray | memoryview, width: int, height: 
 
 
 class FrameDecoder:
-    """Stateful decoder converting raw V4L2 payloads to RGB uint8 NumPy frames."""
+    """Stateful frame reader with optional legacy RGB decoding for diagnostics."""
 
     def __init__(self, *, fast_dct: bool = True) -> None:
         self._fast_dct = fast_dct
@@ -143,6 +145,18 @@ class FrameDecoder:
             gray = np.frombuffer(raw, dtype=np.uint8, count=width * height).reshape(height, width)
             return np.repeat(gray[:, :, np.newaxis], 3, axis=2)
         raise ValueError(f"Unsupported V4L2 pixel format for decoding: {pixel_format!r}")
+
+    def decode_native(
+        self,
+        raw: bytes | bytearray | memoryview,
+        width: int,
+        height: int,
+        pixel_format: str,
+        *,
+        bytesperline: int = 0,
+    ) -> np.ndarray:
+        """Copy a supported uncompressed frame without changing its pixel/color format."""
+        return native_frame(raw, width, height, pixel_format, bytesperline=bytesperline)
 
     def _decode_mjpeg(self, raw: bytes | bytearray | memoryview, width: int, height: int) -> np.ndarray:
         if _TJ_LIB is None or not self._tj_handle:

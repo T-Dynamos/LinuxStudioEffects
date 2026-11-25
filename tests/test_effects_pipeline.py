@@ -71,7 +71,7 @@ class EffectsUnitTests(unittest.TestCase):
     def test_auto_effect_factory_uses_discovered_backend(self) -> None:
         effect = create_effect("mirror")
         self.assertEqual(effect.name, "mirror")
-        self.assertEqual(effect.active_device.value, "cpu")
+        self.assertEqual(effect.active_device.value, resolve_compute_device("mirror", "auto"))
 
     def test_callable_effect_and_disabled_skip(self) -> None:
         def invert(frame: np.ndarray) -> np.ndarray:
@@ -150,6 +150,26 @@ class EffectsUnitTests(unittest.TestCase):
         self.assertEqual(SpotlightEffect(0.5).process(frame).shape, frame.shape)
         self.assertEqual(FastBlurEffect(scale=4, passes=2).process(frame).shape, frame.shape)
 
+    def test_builtin_cpu_effects_preserve_native_yuyv(self) -> None:
+        from linux_studio_effects.video.pixels import split_yuv422
+
+        width, height = 32, 24
+        rng = np.random.default_rng(19)
+        frame = rng.integers(0, 256, size=(height, width // 2, 4), dtype=np.uint8)
+        ctx = FrameContext(1, 0.0, width, height, 30.0, pixel_format="YUYV")
+        for effect in (MirrorEffect(), FastBlurEffect(scale=4), SpotlightEffect(), ZoomCropEffect()):
+            effect.setup(width, height, 30.0)
+            out = effect.process(frame, ctx)
+            self.assertEqual(out.shape, frame.shape, msg=effect.name)
+            self.assertEqual(out.dtype, frame.dtype, msg=effect.name)
+            effect.teardown()
+
+        spotlight = SpotlightEffect().process(frame, ctx)
+        _, input_u, input_v = split_yuv422(frame, "YUYV")
+        _, output_u, output_v = split_yuv422(spotlight, "YUYV")
+        np.testing.assert_array_equal(output_u, input_u)
+        np.testing.assert_array_equal(output_v, input_v)
+
     def test_effects_organized_by_effect_and_backend_file(self) -> None:
         from linux_studio_effects.video.effects.fast_blur.cpu import FastBlurEffect as CpuBlur
         from linux_studio_effects.video.effects.mirror.cpu import MirrorEffect as CpuMirror
@@ -184,6 +204,7 @@ class EffectsUnitTests(unittest.TestCase):
         from linux_studio_effects.video import available_effect_backends
         self.assertEqual(available_effect_backends()["video_depth"], ("cpu", "gpu", "npu"))
         self.assertEqual(available_effect_backends()["greyscale"], ("npu",))
+        self.assertEqual(available_effect_backends()["mirror"], ("cpu", "npu"))
 
 
 class EffectsPipelineLiveTests(unittest.TestCase):
@@ -194,15 +215,18 @@ class EffectsPipelineLiveTests(unittest.TestCase):
         loopback = pick_default_loopback(list(deps.devices))
         if not deps.ok or deps.default_device is None or loopback is None:
             self.skipTest("Requires both an accessible camera and a loaded v4l2loopback device")
+        mode = next((m for m in deps.default_device.modes if m.pixel_format == "YUYV"), None)
+        if mode is None:
+            self.skipTest("Camera has no native YUYV mode matching the loopback format")
 
         tracker = _LifecycleTrackerEffect()
         chain = EffectChain([tracker, SpotlightEffect(edge_dim=0.4)])
         cfg = PipelineConfig(
             input_device=deps.default_device.path,
-            input_width=1280,
-            input_height=720,
-            input_format="MJPG",
-            input_fps=30.0,
+            input_width=mode.width,
+            input_height=mode.height,
+            input_format="YUYV",
+            input_fps=max(mode.fps_options, default=30.0),
             output_device=loopback.path,
             output_width=640,
             output_height=480,
@@ -230,7 +254,9 @@ class EffectsPipelineLiveTests(unittest.TestCase):
         t.join(timeout=5.0)
         stats = holder.get("stats")
         self.assertIsNotNone(stats)
-        self.assertEqual(tracker.setup_calls, [(1280, 720, 30.0)])
+        self.assertEqual(len(tracker.setup_calls), 1)
+        self.assertEqual(tracker.setup_calls[0][:2], (mode.width, mode.height))
+        self.assertGreater(tracker.setup_calls[0][2], 0.0)
         self.assertEqual(tracker.teardown_calls, 1)
         self.assertGreater(len(tracker.seen_contexts), 20)
 

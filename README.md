@@ -43,7 +43,10 @@ VideoPipeline(PipelineConfig(), effect=graph).run()
 
 The camera frame enters the graph, graph nodes can consume the camera or an
 earlier node, and the selected output continues through the pipeline to the
-virtual camera:
+virtual camera. Live capture carries packed `YUYV`, `UYVY`, `RGB3`, or `BGR3`
+frames through this path unchanged. The camera and loopback must negotiate the
+same FourCC and colorimetry; the pipeline does not decode or convert between
+color spaces. Output resizing operates on the original packed format.
 
 ```mermaid
 flowchart LR
@@ -56,7 +59,7 @@ flowchart LR
         Grey -. alternate output .-> Selected
     end
     Selected --> Resize[Output resize and format]
-    Resize --> VCam[Virtual camera /dev/video4]
+    Resize[Resize in same pixel format] --> VCam[Virtual camera /dev/video4]
 ```
 
 ### Prerequisites

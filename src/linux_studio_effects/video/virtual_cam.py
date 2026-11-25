@@ -10,7 +10,6 @@ import numpy as np
 from .v4l2 import (
     V4L2_BUF_TYPE_VIDEO_OUTPUT,
     V4L2_CAP_VIDEO_OUTPUT,
-    V4L2_COLORSPACE_SRGB,
     V4L2_FIELD_NONE,
     VIDIOC_S_FMT,
     VIDIOC_S_PARM,
@@ -25,7 +24,7 @@ from .v4l2 import (
     xioctl,
 )
 
-SUPPORTED_OUTPUT_FORMATS = ("YUYV", "RGB3", "BGR3")
+SUPPORTED_OUTPUT_FORMATS = ("YUYV", "UYVY", "RGB3", "BGR3")
 
 
 @dataclass(frozen=True)
@@ -39,6 +38,10 @@ class VirtualCameraConfig:
     fps: float = 30.0
     bytesperline: int = 0
     sizeimage: int = 0
+    colorspace: int = 0
+    ycbcr_enc: int = 0
+    quantization: int = 0
+    xfer_func: int = 0
 
 
 def resize_rgb(frame: np.ndarray, out_width: int, out_height: int, *, mode: str = "cover") -> np.ndarray:
@@ -150,13 +153,12 @@ def encode_rgb_frame(
 
 
 class VirtualCameraOutput:
-    """Writes RGB frames to a v4l2loopback virtual webcam device."""
+    """Writes pixel-format-preserving frames to a v4l2loopback device."""
 
     def __init__(self, config: VirtualCameraConfig | None = None) -> None:
         self._requested = config or VirtualCameraConfig()
         self._negotiated: VirtualCameraConfig | None = None
         self._fd: int | None = None
-        self._yuyv_scratch: _YuyvScratch | None = None
 
     @property
     def negotiated(self) -> VirtualCameraConfig:
@@ -185,8 +187,8 @@ class VirtualCameraOutput:
             raise ValueError(
                 f"Unsupported output format {fmt_name!r}; choose one of {SUPPORTED_OUTPUT_FORMATS}"
             )
-        if fmt_name == "YUYV" and self._requested.width % 2 != 0:
-            raise ValueError(f"YUYV output width must be even, got {self._requested.width}")
+        if fmt_name in {"YUYV", "UYVY"} and self._requested.width % 2 != 0:
+            raise ValueError(f"{fmt_name} output width must be even, got {self._requested.width}")
 
         fd = os.open(dev_path, os.O_RDWR)
         try:
@@ -196,7 +198,7 @@ class VirtualCameraOutput:
             if not (effective_caps & V4L2_CAP_VIDEO_OUTPUT):
                 raise RuntimeError(f"{dev_path} does not support V4L2_CAP_VIDEO_OUTPUT (not a loopback device)")
 
-            bpp = 2 if fmt_name == "YUYV" else 3
+            bpp = 2 if fmt_name in {"YUYV", "UYVY"} else 3
             fmt = v4l2_format()
             fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT
             fmt.fmt.pix.width = self._requested.width
@@ -205,8 +207,17 @@ class VirtualCameraOutput:
             fmt.fmt.pix.field = V4L2_FIELD_NONE
             fmt.fmt.pix.bytesperline = self._requested.width * bpp
             fmt.fmt.pix.sizeimage = self._requested.width * self._requested.height * bpp
-            fmt.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB
+            fmt.fmt.pix.colorspace = self._requested.colorspace
+            fmt.fmt.pix.ycbcr_enc = self._requested.ycbcr_enc
+            fmt.fmt.pix.quantization = self._requested.quantization
+            fmt.fmt.pix.xfer_func = self._requested.xfer_func
             xioctl(fd, VIDIOC_S_FMT, fmt)
+            actual_format = fourcc_to_str(fmt.fmt.pix.pixelformat)
+            if actual_format != fmt_name:
+                raise RuntimeError(
+                    f"{dev_path} negotiated {actual_format} instead of requested {fmt_name}; "
+                    "format conversion is disabled"
+                )
 
             actual_fps = self._configure_fps(fd, self._requested.fps)
 
@@ -219,6 +230,10 @@ class VirtualCameraOutput:
                 fps=actual_fps,
                 bytesperline=fmt.fmt.pix.bytesperline,
                 sizeimage=fmt.fmt.pix.sizeimage,
+                colorspace=fmt.fmt.pix.colorspace,
+                ycbcr_enc=fmt.fmt.pix.ycbcr_enc,
+                quantization=fmt.fmt.pix.quantization,
+                xfer_func=fmt.fmt.pix.xfer_func,
             )
             return self._negotiated
         except Exception:
@@ -242,24 +257,30 @@ class VirtualCameraOutput:
             pass
         return target_fps
 
-    def write_frame(self, rgb: np.ndarray) -> int:
-        """Encode (if needed) and write an RGB frame to the loopback device."""
+    def write_frame(self, frame: np.ndarray) -> int:
+        """Write a frame directly in the negotiated pixel format, without conversion."""
         if self._fd is None or self._negotiated is None:
             raise RuntimeError("Virtual camera output is not open")
 
-        expected_shape = (self._negotiated.height, self._negotiated.width, 3)
-        if rgb.shape != expected_shape:
-            raise ValueError(f"Expected RGB shape {expected_shape}, got {rgb.shape}")
+        fmt = self._negotiated.pixel_format.upper()
+        expected_shape = (
+            (self._negotiated.height, self._negotiated.width // 2, 4)
+            if fmt in {"YUYV", "UYVY"}
+            else (self._negotiated.height, self._negotiated.width, 3)
+        )
+        if frame.shape != expected_shape:
+            raise ValueError(f"Expected {fmt} frame shape {expected_shape}, got {frame.shape}")
 
-        if self._yuyv_scratch is None or self._yuyv_scratch.shape != (
-            self._negotiated.height,
-            self._negotiated.width,
-        ):
-            if self._negotiated.pixel_format == "YUYV":
-                self._yuyv_scratch = _YuyvScratch(self._negotiated.height, self._negotiated.width)
-
-        encoded = encode_rgb_frame(rgb, self._negotiated.pixel_format, scratch=self._yuyv_scratch)
-        with memoryview(encoded) as view:
+        packed = np.ascontiguousarray(frame)
+        row_bytes = expected_shape[1] * expected_shape[2]
+        stride = self._negotiated.bytesperline or row_bytes
+        if stride < row_bytes:
+            raise RuntimeError(f"Negotiated {fmt} row stride {stride} is smaller than frame row size {row_bytes}")
+        if stride != row_bytes:
+            padded = np.zeros((expected_shape[0], stride), dtype=np.uint8)
+            padded[:, :row_bytes] = packed.reshape(expected_shape[0], row_bytes)
+            packed = padded
+        with memoryview(packed) as view:
             written = os.write(self._fd, view)
         return written
 

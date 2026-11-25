@@ -59,3 +59,8 @@ Run any example from the repository root using `.ironenv/bin/python` (or Python 
    ./.ironenv/bin/python examples/09_run_effect.py --effect mirror --in-size 2592x1944 --out-size 1920x1080
    ./.ironenv/bin/python examples/09_run_effect.py --effect video_depth --device auto
    ```
+
+10. **[10_benchmark_effect_backends.py](10_benchmark_effect_backends.py)** — Benchmark each discovered effect/backend on real camera frames. Depth effects use RGB3 modes; other effects use a matching native camera mode. Depth weights are synthetic by default.
+    ```bash
+    ./.ironenv/bin/python examples/10_benchmark_effect_backends.py --duration 3
+    ```

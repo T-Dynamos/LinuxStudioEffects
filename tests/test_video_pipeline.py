@@ -51,6 +51,15 @@ class VideoPipelineUnitTests(unittest.TestCase):
         bgr = encode_rgb_frame(rgb, "BGR3")
         np.testing.assert_array_equal(bgr[0, 0], [30, 20, 10])
 
+    def test_native_frame_keeps_packed_bytes_and_skips_row_padding(self) -> None:
+        from linux_studio_effects.video.pixels import native_frame, resize_native
+
+        raw = bytes((1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 11, 12, 13, 14, 15, 16, 17, 18, 99, 99))
+        frame = native_frame(raw, 4, 2, "YUYV", bytesperline=10)
+        self.assertEqual(frame.shape, (2, 2, 4))
+        self.assertEqual(frame.tobytes(), bytes((1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18)))
+        self.assertIs(resize_native(frame, 4, 2, "YUYV"), frame)
+
     def test_resize_rgb_cover_and_stretch(self) -> None:
         # 1280x720 image with bright white center stripe and black sides.
         img = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -117,13 +126,16 @@ class VideoPipelineLiveTests(unittest.TestCase):
         loopback = pick_default_loopback(list(deps.devices))
         if not deps.ok or deps.default_device is None or loopback is None:
             self.skipTest("Requires both an accessible camera and a loaded v4l2loopback device")
+        mode = next((m for m in deps.default_device.modes if m.pixel_format == "YUYV"), None)
+        if mode is None:
+            self.skipTest("Camera has no native YUYV mode matching the loopback format")
 
         cfg = PipelineConfig(
             input_device=deps.default_device.path,
-            input_width=1280,
-            input_height=720,
-            input_format="MJPG",
-            input_fps=30.0,
+            input_width=mode.width,
+            input_height=mode.height,
+            input_format="YUYV",
+            input_fps=max(mode.fps_options, default=30.0),
             output_device=loopback.path,
             output_width=640,
             output_height=480,

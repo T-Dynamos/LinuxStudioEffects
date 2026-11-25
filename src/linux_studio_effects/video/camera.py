@@ -53,6 +53,10 @@ class CameraConfig:
     buffer_count: int = 4
     bytesperline: int = 0
     sizeimage: int = 0
+    colorspace: int = 0
+    ycbcr_enc: int = 0
+    quantization: int = 0
+    xfer_func: int = 0
 
 
 @dataclass(frozen=True)
@@ -117,6 +121,12 @@ class V4L2Camera:
             fmt.fmt.pix.pixelformat = str_to_fourcc(self._requested.pixel_format)
             fmt.fmt.pix.field = V4L2_FIELD_ANY
             xioctl(fd, VIDIOC_S_FMT, fmt)
+            actual_format = fourcc_to_str(fmt.fmt.pix.pixelformat)
+            if actual_format != self._requested.pixel_format.upper():
+                raise RuntimeError(
+                    f"{dev_path} negotiated {actual_format} instead of requested "
+                    f"{self._requested.pixel_format.upper()}; format conversion is disabled"
+                )
 
             actual_fps = self._configure_fps(fd, self._requested.fps)
 
@@ -162,6 +172,10 @@ class V4L2Camera:
                 buffer_count=req.count,
                 bytesperline=fmt.fmt.pix.bytesperline,
                 sizeimage=fmt.fmt.pix.sizeimage,
+                colorspace=fmt.fmt.pix.colorspace,
+                ycbcr_enc=fmt.fmt.pix.ycbcr_enc,
+                quantization=fmt.fmt.pix.quantization,
+                xfer_func=fmt.fmt.pix.xfer_func,
             )
             return self._negotiated
         except Exception:
@@ -190,7 +204,13 @@ class V4L2Camera:
             return round(den / num, 3)
         return target_fps
 
-    def read_frame(self, *, decode: bool = True, timeout_s: float = 2.0) -> CapturedFrame:
+    def read_frame(
+        self,
+        *,
+        decode: bool = True,
+        native: bool = False,
+        timeout_s: float = 2.0,
+    ) -> CapturedFrame:
         """Wait for and return the next frame from the V4L2 MMAP queue."""
         if self._fd is None or not self._streaming or self._negotiated is None:
             raise RuntimeError("Camera stream is not open")
@@ -223,11 +243,14 @@ class V4L2Camera:
                 mm = self._mmaps[buf.index]
                 t0 = time.perf_counter()
                 with memoryview(mm)[:raw_size] as view:
-                    frame_arr = self._decoder.decode(
+                    decode_frame = self._decoder.decode_native if native else self._decoder.decode
+                    kwargs = {"bytesperline": self._negotiated.bytesperline} if native else {}
+                    frame_arr = decode_frame(
                         view,
                         self._negotiated.width,
                         self._negotiated.height,
                         self._negotiated.pixel_format,
+                        **kwargs,
                     )
                 decode_t = time.perf_counter() - t0
         finally:

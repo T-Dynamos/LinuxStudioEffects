@@ -25,13 +25,14 @@ class DeviceUnavailableError(RuntimeError):
 
 @dataclass(frozen=True)
 class FrameContext:
-    """Per-frame metadata passed to frame processors during streaming."""
+    """Per-frame metadata, including the unchanged native V4L2 pixel format."""
 
     frame_index: int
     timestamp_s: float
     width: int
     height: int
     fps: float
+    pixel_format: str = "RGB3"
 
 
 class FrameEffect(ABC):
@@ -66,7 +67,7 @@ class FrameEffect(ABC):
 
     @abstractmethod
     def process(self, frame: np.ndarray, ctx: FrameContext | None = None) -> np.ndarray:
-        """Transform one (H, W, 3) uint8 RGB frame into a uint8 RGB frame."""
+        """Transform a packed uint8 frame while preserving its pixel format."""
 
     def teardown(self) -> None:
         """Release backend buffers/models when streaming stops."""

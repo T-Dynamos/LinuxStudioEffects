@@ -70,14 +70,17 @@ class NpuGreyscaleTests(unittest.TestCase):
         loopback = pick_default_loopback(list(deps.devices))
         if not deps.ok or deps.default_device is None or loopback is None:
             self.skipTest("Requires both an accessible camera and a loaded v4l2loopback device")
+        mode = next((m for m in deps.default_device.modes if m.pixel_format == "YUYV"), None)
+        if mode is None:
+            self.skipTest("Camera has no native YUYV mode matching the loopback format")
 
         eff = GreyscaleEffect()
         cfg = PipelineConfig(
             input_device=deps.default_device.path,
-            input_width=1280,
-            input_height=720,
-            input_format="MJPG",
-            input_fps=30.0,
+            input_width=mode.width,
+            input_height=mode.height,
+            input_format="YUYV",
+            input_fps=max(mode.fps_options, default=30.0),
             output_device=loopback.path,
             output_width=640,
             output_height=480,

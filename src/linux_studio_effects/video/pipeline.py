@@ -6,6 +6,7 @@ import argparse
 import statistics
 import threading
 import time
+from contextlib import ExitStack
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -13,7 +14,8 @@ import numpy as np
 
 from .camera import CameraConfig, V4L2Camera
 from .effects import BUILTIN_EFFECTS, EffectChain, FrameContext, FrameEffect, as_frame_effect
-from .virtual_cam import VirtualCameraConfig, VirtualCameraOutput, resize_rgb
+from .pixels import NATIVE_PIXEL_FORMATS, is_yuv422, resize_native
+from .virtual_cam import VirtualCameraConfig, VirtualCameraOutput
 
 FrameProcessor = FrameEffect | Callable[[np.ndarray], np.ndarray]
 StatsCallback = Callable[["PipelineStats"], None]
@@ -26,7 +28,7 @@ class PipelineConfig:
     input_device: str = ""
     input_width: int = 1280
     input_height: int = 720
-    input_format: str = "MJPG"
+    input_format: str = "YUYV"
     input_fps: float = 30.0
     output_device: str = ""
     output_width: int = 1280
@@ -102,22 +104,59 @@ class VideoPipeline:
         self._stop_event.clear()
         cfg = self._config
 
+        input_format = cfg.input_format.upper()
+        output_format = cfg.output_format.upper()
+        if input_format not in NATIVE_PIXEL_FORMATS:
+            raise ValueError(
+                f"Unsupported native input format {input_format}; choose one of {NATIVE_PIXEL_FORMATS}. "
+                "Compressed MJPG is not decoded in the live effects pipeline."
+            )
+        if output_format not in NATIVE_PIXEL_FORMATS:
+            raise ValueError(f"Unsupported native output format {output_format}; choose one of {NATIVE_PIXEL_FORMATS}")
+        if input_format != output_format:
+            raise ValueError(
+                f"Input {input_format} and output {output_format} differ; "
+                "pixel/color-space conversion is disabled. Use the same format at both ends."
+            )
         in_cfg = CameraConfig(
             device=cfg.input_device,
             width=cfg.input_width,
             height=cfg.input_height,
-            pixel_format=cfg.input_format,
+            pixel_format=input_format,
             fps=cfg.input_fps,
         )
-        out_cfg = VirtualCameraConfig(
-            device=cfg.output_device,
-            width=cfg.output_width,
-            height=cfg.output_height,
-            pixel_format=cfg.output_format,
-            fps=cfg.output_fps,
-        )
 
-        with V4L2Camera(in_cfg) as cam, VirtualCameraOutput(out_cfg) as vcam:
+        with ExitStack() as stack:
+            cam = stack.enter_context(V4L2Camera(in_cfg))
+            out_cfg = VirtualCameraConfig(
+                device=cfg.output_device,
+                width=cfg.output_width,
+                height=cfg.output_height,
+                pixel_format=output_format,
+                fps=cfg.output_fps,
+                colorspace=cam.negotiated.colorspace,
+                ycbcr_enc=cam.negotiated.ycbcr_enc,
+                quantization=cam.negotiated.quantization,
+                xfer_func=cam.negotiated.xfer_func,
+            )
+            vcam = stack.enter_context(VirtualCameraOutput(out_cfg))
+            in_colorimetry = (
+                cam.negotiated.colorspace,
+                cam.negotiated.ycbcr_enc,
+                cam.negotiated.quantization,
+                cam.negotiated.xfer_func,
+            )
+            out_colorimetry = (
+                vcam.negotiated.colorspace,
+                vcam.negotiated.ycbcr_enc,
+                vcam.negotiated.quantization,
+                vcam.negotiated.xfer_func,
+            )
+            if in_colorimetry != out_colorimetry:
+                raise RuntimeError(
+                    f"Input/output colorimetry differs ({in_colorimetry} != {out_colorimetry}); "
+                    "color conversion is disabled"
+                )
             self._negotiated_in = cam.negotiated
             self._negotiated_out = vcam.negotiated
 
@@ -149,7 +188,7 @@ class VideoPipeline:
 
                     # Determine whether this captured frame should be emitted to output.
                     should_emit = target_out_period <= 0.0 or now >= next_out_deadline - 0.002
-                    frame = cam.read_frame(decode=should_emit)
+                    frame = cam.read_frame(decode=should_emit, native=True)
                     frames_in += 1
                     dropped_in += frame.dropped_since_last
                     frame_now = frame.capture_monotonic_s
@@ -163,18 +202,24 @@ class VideoPipeline:
                                 width=frame.width,
                                 height=frame.height,
                                 fps=cam.negotiated.fps,
+                                pixel_format=cam.negotiated.pixel_format,
                             )
-                            out_rgb = self._effect.process(frame.data, ctx)
+                            out_frame = self._effect.process(frame.data, ctx)
                         else:
-                            out_rgb = frame.data
-                        if out_rgb.shape[1] != vcam.negotiated.width or out_rgb.shape[0] != vcam.negotiated.height:
-                            out_rgb = resize_rgb(
-                                out_rgb,
+                            out_frame = frame.data
+                        if out_frame.shape[0] != vcam.negotiated.height or (
+                            out_frame.shape[1] * 2
+                            if is_yuv422(cam.negotiated.pixel_format)
+                            else out_frame.shape[1]
+                        ) != vcam.negotiated.width:
+                            out_frame = resize_native(
+                                out_frame,
                                 vcam.negotiated.width,
                                 vcam.negotiated.height,
+                                cam.negotiated.pixel_format,
                                 mode=cfg.resize_mode,
                             )
-                        vcam.write_frame(out_rgb)
+                        vcam.write_frame(out_frame)
                         proc_ms_samples.append((time.perf_counter() - t0) * 1000.0)
                         frames_out += 1
 
@@ -238,11 +283,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run configurable V4L2 camera -> v4l2loopback pipeline.")
     parser.add_argument("--in-device", default="", help="Input camera path (default: auto-detect)")
     parser.add_argument("--in-size", type=_parse_size, default=(1280, 720), help="Input WxH (default: 1280x720)")
-    parser.add_argument("--in-format", default="MJPG", help="Input FourCC (default: MJPG)")
+    parser.add_argument("--in-format", default="YUYV", help="Uncompressed native input FourCC (default: YUYV)")
     parser.add_argument("--in-fps", type=float, default=30.0, help="Input FPS (default: 30)")
     parser.add_argument("--out-device", default="", help="Output v4l2loopback path (default: auto-detect)")
     parser.add_argument("--out-size", type=_parse_size, default=(1280, 720), help="Output WxH (default: 1280x720)")
-    parser.add_argument("--out-format", default="YUYV", help="Output FourCC: YUYV, RGB3, BGR3 (default: YUYV)")
+    parser.add_argument("--out-format", default="YUYV", help="Output FourCC; must match --in-format exactly")
     parser.add_argument("--out-fps", type=float, default=30.0, help="Output FPS (default: 30)")
     parser.add_argument("--resize-mode", choices=("cover", "stretch"), default="cover")
     parser.add_argument(

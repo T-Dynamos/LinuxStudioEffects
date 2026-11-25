@@ -47,6 +47,36 @@ extern "C" void lse_rgb2gray_rgb(const uint8_t *__restrict in, uint8_t *__restri
 }
 """
 
+_BGR2GRAY_C_SRC = _RGB2GRAY_C_SRC.replace(
+    "lse_rgb2gray_rgb", "lse_rgb2gray_bgr"
+).replace("p[k * 3 + 0];", "p[k * 3 + TEMP];", 1).replace(
+    "p[k * 3 + 2];", "p[k * 3 + 0];", 1
+).replace("p[k * 3 + TEMP];", "p[k * 3 + 2];", 1)
+# The fallback loop uses the same channel order as the vector loop.
+_BGR2GRAY_C_SRC = _BGR2GRAY_C_SRC.replace(
+    "in[i * 3 + 0];", "in[i * 3 + TEMP];", 1
+).replace("in[i * 3 + 2];", "in[i * 3 + 0];", 1).replace("in[i * 3 + TEMP];", "in[i * 3 + 2];", 1)
+
+_YUYV2GRAY_C_SRC = r"""
+#include <stdint.h>
+extern "C" void lse_yuyv2gray(uint8_t *__restrict in, uint8_t *__restrict out, int32_t num_pairs) {
+    for (int i = 0; i < num_pairs; ++i) {
+        out[i * 4 + 0] = in[i * 4 + 0]; out[i * 4 + 1] = 128;
+        out[i * 4 + 2] = in[i * 4 + 2]; out[i * 4 + 3] = 128;
+    }
+}
+"""
+
+_UYVY2GRAY_C_SRC = r"""
+#include <stdint.h>
+extern "C" void lse_uyvy2gray(uint8_t *__restrict in, uint8_t *__restrict out, int32_t num_pairs) {
+    for (int i = 0; i < num_pairs; ++i) {
+        out[i * 4 + 0] = 128; out[i * 4 + 1] = in[i * 4 + 1];
+        out[i * 4 + 2] = 128; out[i * 4 + 3] = in[i * 4 + 3];
+    }
+}
+"""
+
 _TILE_PIXEL_CANDIDATES = (2560, 1280, 640, 320, 160, 64, 32, 16, 4, 1)
 
 
@@ -61,15 +91,18 @@ def select_npu_tiling(num_pixels: int) -> tuple[int, int]:
     return 1, 1
 
 
-@lru_cache(maxsize=16)
-def _build_greyscale_kernel(total_bytes: int, num_workers: int, tile_pixels: int) -> Any:
-    """Compile and cache an IRON @jit RGB->Greyscale kernel for a given frame geometry."""
+@lru_cache(maxsize=32)
+def _build_greyscale_kernel(total_bytes: int, num_workers: int, tile_pixels: int, pixel_format: str = "RGB3") -> Any:
+    """Compile and cache an IRON greyscale kernel for native RGB or packed YUV422."""
     import aie.iron as iron
     from aie.iron import CompileTime, ExternalFunction, In, ObjectFifo, Out, Program, Runtime, Worker
     from aie.iron.controlflow import range_
 
     iron.ensure_current_device()
-    tile_bytes = tile_pixels * 3
+    fmt = pixel_format.upper()
+    yuv422 = fmt in {"YUYV", "UYVY"}
+    unit_bytes = 4 if yuv422 else 3
+    tile_bytes = tile_pixels * unit_bytes
     chunks = total_bytes // (num_workers * tile_bytes)
 
     @iron.jit
@@ -87,8 +120,22 @@ def _build_greyscale_kernel(total_bytes: int, num_workers: int, tile_pixels: int
         tile_ty = np.ndarray[(k_tile_bytes,), np.dtype[np.uint8]]
 
         ext_fn = ExternalFunction(
-            "lse_rgb2gray_rgb",
-            source_string=_RGB2GRAY_C_SRC,
+            "lse_yuyv2gray"
+            if fmt == "YUYV"
+            else "lse_uyvy2gray"
+            if fmt == "UYVY"
+            else "lse_rgb2gray_bgr"
+            if fmt == "BGR3"
+            else "lse_rgb2gray_rgb",
+            source_string=(
+                _YUYV2GRAY_C_SRC
+                if fmt == "YUYV"
+                else _UYVY2GRAY_C_SRC
+                if fmt == "UYVY"
+                else _BGR2GRAY_C_SRC
+                if fmt == "BGR3"
+                else _RGB2GRAY_C_SRC
+            ),
             arg_types=[tile_ty, tile_ty, np.int32],
         )
 
@@ -126,13 +173,13 @@ def _build_greyscale_kernel(total_bytes: int, num_workers: int, tile_pixels: int
 
 
 class GreyscaleEffect(FrameEffect):
-    """Convert RGB video frames to BT.601 greyscale RGB on the AMD Ryzen AI NPU."""
+    """Greyscale RGB or neutral-chroma YUV422 frames on the AMD Ryzen AI NPU."""
 
     effect_name = "greyscale"
 
     def __init__(self, *, name: str | None = None, device: ComputeDevice | str = ComputeDevice.NPU, enabled: bool = True) -> None:
         super().__init__(name=name, device=device, enabled=enabled)
-        self._shape: tuple[int, int] | None = None
+        self._shape: tuple[int, int, str] | None = None
         self._total_bytes: int = 0
         self._num_workers: int = 1
         self._tile_pixels: int = 1
@@ -142,18 +189,22 @@ class GreyscaleEffect(FrameEffect):
         self._in_tensor: Any = None
         self._out_tensor: Any = None
 
-    def setup(self, width: int, height: int, fps: float) -> None:
+    def setup(self, width: int, height: int, fps: float, *, pixel_format: str | None = None) -> None:
+        super().setup(width, height, fps)
+        if pixel_format is None:
+            return
         import aie.iron as iron
         from aie.utils import DefaultNPURuntime
 
-        super().setup(width, height, fps)
-        if self._shape == (height, width) and self._handle is not None and self._in_tensor is not None:
+        fmt = pixel_format.upper()
+        if self._shape == (height, width, fmt) and self._handle is not None and self._in_tensor is not None:
             return
 
-        num_pixels = width * height
-        total_bytes = num_pixels * 3
-        workers, tile_pixels = select_npu_tiling(num_pixels)
-        kernel = _build_greyscale_kernel(total_bytes, workers, tile_pixels)
+        num_units = width * height // 2 if fmt in {"YUYV", "UYVY"} else width * height
+        unit_bytes = 4 if fmt in {"YUYV", "UYVY"} else 3
+        total_bytes = num_units * unit_bytes
+        workers, tile_pixels = select_npu_tiling(num_units)
+        kernel = _build_greyscale_kernel(total_bytes, workers, tile_pixels, fmt)
 
         in_tensor = iron.zeros(total_bytes, dtype=np.uint8, device="npu")
         out_tensor = iron.zeros(total_bytes, dtype=np.uint8, device="npu")
@@ -164,13 +215,13 @@ class GreyscaleEffect(FrameEffect):
             k_total_bytes=total_bytes,
             k_workers=workers,
             k_tile_pixels=tile_pixels,
-            k_tile_bytes=tile_pixels * 3,
-            k_chunks=total_bytes // (workers * tile_pixels * 3),
+            k_tile_bytes=tile_pixels * unit_bytes,
+            k_chunks=total_bytes // (workers * tile_pixels * unit_bytes),
         )
         npu_kernel = next(iter(kernel._kernel_cache.values()))
         handle = DefaultNPURuntime.load(npu_kernel)
 
-        self._shape = (height, width)
+        self._shape = (height, width, fmt)
         self._total_bytes = total_bytes
         self._num_workers = workers
         self._tile_pixels = tile_pixels
@@ -181,18 +232,27 @@ class GreyscaleEffect(FrameEffect):
         self._out_tensor = out_tensor
 
     def process(self, frame: np.ndarray, ctx: FrameContext | None = None) -> np.ndarray:
-        if frame.ndim != 3 or frame.shape[2] != 3:
-            raise ValueError(f"Expected (H, W, 3) RGB frame, got {frame.shape}")
-        h, w, _ = frame.shape
-        if self._shape != (h, w) or self._handle is None or self._in_tensor is None or self._out_tensor is None:
-            self.setup(w, h, ctx.fps if ctx else 30.0)
+        pixel_format = ctx.pixel_format.upper() if ctx else ("YUYV" if frame.ndim == 3 and frame.shape[-1] == 4 else "RGB3")
+        if pixel_format in {"YUYV", "UYVY"}:
+            if frame.ndim != 3 or frame.shape[2] != 4:
+                raise ValueError(f"Expected packed {pixel_format} pairs, got {frame.shape}")
+            h, pair_width, _ = frame.shape
+            w = ctx.width if ctx else pair_width * 2
+            if pair_width * 2 != w:
+                raise ValueError(f"Packed {pixel_format} width does not match frame context ({pair_width * 2} != {w})")
+        else:
+            if pixel_format not in {"RGB3", "BGR3"} or frame.ndim != 3 or frame.shape[2] != 3:
+                raise ValueError(f"Unsupported greyscale frame {pixel_format}: {frame.shape}")
+            h, w, _ = frame.shape
+        if self._shape != (h, w, pixel_format) or self._handle is None or self._in_tensor is None or self._out_tensor is None:
+            self.setup(w, h, ctx.fps if ctx else 30.0, pixel_format=pixel_format)
 
         flat = np.ascontiguousarray(frame, dtype=np.uint8).reshape(-1)
         with self._in_tensor.overwrite() as dst:
             np.copyto(dst, flat)
 
         self._runtime.run(self._handle, [self._in_tensor, self._out_tensor])
-        return self._out_tensor.numpy().reshape(h, w, 3).copy()
+        return self._out_tensor.numpy().reshape(frame.shape).copy()
 
     def teardown(self) -> None:
         self._handle = None

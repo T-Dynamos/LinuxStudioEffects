@@ -120,15 +120,15 @@ def _count_params_and_flops(cfg: DepthAnythingConfig) -> tuple[int, float, float
 def analyze_feasibility(
     cfg: DepthAnythingConfig,
     *,
-    npu_matmul_gflops: float = 20.0,
-    npu_dispatch_overhead_ms: float = 12.0,
+    npu_matmul_gflops: float = 150.0,
+    npu_dispatch_overhead_ms: float = 1.0,
     gpu_fp16_gflops: float = 1200.0,
     cpu_fp32_gflops: float = 140.0,
 ) -> FeasibilityReport:
     """Estimate memory footprint, NPU1 SRAM/dispatch feasibility, and realistic FPS bounds.
 
-    Default throughput baselines reflect single-process/4-column NPU1 bf16 measurements
-    (~17-25 GFLOP/s effective + ~12 ms dispatch overhead per IRON kernel call),
+    Default throughput baselines reflect preloaded-handle 4-column NPU1 bf16 measurements
+    (~150-210 GFLOP/s effective + ~1 ms HRX dispatch/sync overhead per fused-QKV kernel call),
     Ryzen 7 7840U CPU (OpenBLAS), and Radeon 780M iGPU (gfx1103 FP16 effective).
     """
     total_params, bb_gf, dpt_gf = _count_params_and_flops(cfg)
@@ -145,8 +145,8 @@ def analyze_feasibility(
     peak_act_mb = max(attn_act, mlp_act) / (1024 * 1024)
 
     # Dispatches when each Transformer linear projection (QKV, OutProj, FC1, FC2) runs on NPU:
-    # 1 patch embed + depth * (QKV-fused or 3 QKV + OutProj + FC1 + FC2)
-    npu_dispatches = 1 + cfg.depth * 6
+    # 1 patch embed + depth * (fused-QKV + OutProj + FC1 + FC2)
+    npu_dispatches = 1 + cfg.depth * 4
 
     # NPU1 tile fit: 32x64 @ 64x64 bf16 uses 4KB + 8KB + 4KB = 16KB (*2 ping-pong = 32KB <= 64KB SRAM)
     npu_sram_fit = True

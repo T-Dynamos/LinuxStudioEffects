@@ -201,6 +201,7 @@ class DepthAnythingV2Model:
         self._npu_mm: NpuMatMulExecutor | None = None
         self._pos_embed_cache: dict[tuple[int, int], np.ndarray] = {}
         self._wt_cache: dict[int, np.ndarray] = {}
+        self._qkv_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._torch_ctx: dict[str, Any] | None = None
 
         if self.backend == "npu":
@@ -304,17 +305,29 @@ class DepthAnythingV2Model:
         self._pos_embed_cache[key] = res
         return res
 
+    def _linear_wt(self, x: np.ndarray, wt: np.ndarray, bias: np.ndarray) -> np.ndarray:
+        if self._npu_mm is not None:
+            y = self._npu_mm.matmul(x, wt, cache_b=True)
+        else:
+            y = x @ wt
+        return y + bias
+
     def _linear(self, x: np.ndarray, weight_out_in: np.ndarray, bias: np.ndarray) -> np.ndarray:
         wid = id(weight_out_in)
         wt = self._wt_cache.get(wid)
         if wt is None:
             wt = np.ascontiguousarray(weight_out_in.T)
             self._wt_cache[wid] = wt
-        if self._npu_mm is not None:
-            y = self._npu_mm.matmul(x, wt, cache_b=True)
-        else:
-            y = x @ wt
-        return y + bias
+        return self._linear_wt(x, wt, bias)
+
+    def _get_qkv_wt(self, idx: int, blk: Any) -> tuple[np.ndarray, np.ndarray]:
+        cached = self._qkv_cache.get(idx)
+        if cached is not None:
+            return cached
+        wt = np.ascontiguousarray(np.concatenate([blk.q_weight, blk.k_weight, blk.v_weight], axis=0).T)
+        bias = np.ascontiguousarray(np.concatenate([blk.q_bias, blk.k_bias, blk.v_bias], axis=0))
+        self._qkv_cache[idx] = (wt, bias)
+        return wt, bias
 
     def preprocess(self, rgb: np.ndarray) -> np.ndarray:
         """Resize (H, W, 3) uint8 RGB frame to (1, 3, S, S) normalized float32."""
@@ -356,10 +369,10 @@ class DepthAnythingV2Model:
         for idx, blk in enumerate(w.blocks):
             h_norm = _layer_norm(x, blk.norm1_weight, blk.norm1_bias, cfg.layer_norm_eps)
 
-            # Fused QKV linear or 3 projections
-            q = self._linear(h_norm, blk.q_weight, blk.q_bias)
-            k = self._linear(h_norm, blk.k_weight, blk.k_bias)
-            v = self._linear(h_norm, blk.v_weight, blk.v_bias)
+            # Fused QKV projection: 1 dispatch instead of 3 separate Q, K, V MatMuls
+            qkv_wt, qkv_bias = self._get_qkv_wt(idx, blk)
+            qkv = self._linear_wt(h_norm, qkv_wt, qkv_bias)
+            q, k, v = np.split(qkv, 3, axis=-1)
 
             qh = q.reshape(n_tok, cfg.num_heads, cfg.head_dim).transpose(1, 0, 2)
             kh = k.reshape(n_tok, cfg.num_heads, cfg.head_dim).transpose(1, 2, 0)

@@ -137,14 +137,17 @@ class GreyscaleEffect(FrameEffect):
         self._num_workers: int = 1
         self._tile_pixels: int = 1
         self._kernel: Any = None
+        self._runtime: Any = None
+        self._handle: Any = None
         self._in_tensor: Any = None
         self._out_tensor: Any = None
 
     def setup(self, width: int, height: int, fps: float) -> None:
         import aie.iron as iron
+        from aie.utils import DefaultNPURuntime
 
         super().setup(width, height, fps)
-        if self._shape == (height, width) and self._kernel is not None and self._in_tensor is not None:
+        if self._shape == (height, width) and self._handle is not None and self._in_tensor is not None:
             return
 
         num_pixels = width * height
@@ -164,12 +167,16 @@ class GreyscaleEffect(FrameEffect):
             k_tile_bytes=tile_pixels * 3,
             k_chunks=total_bytes // (workers * tile_pixels * 3),
         )
+        npu_kernel = next(iter(kernel._kernel_cache.values()))
+        handle = DefaultNPURuntime.load(npu_kernel)
 
         self._shape = (height, width)
         self._total_bytes = total_bytes
         self._num_workers = workers
         self._tile_pixels = tile_pixels
         self._kernel = kernel
+        self._runtime = DefaultNPURuntime
+        self._handle = handle
         self._in_tensor = in_tensor
         self._out_tensor = out_tensor
 
@@ -177,25 +184,19 @@ class GreyscaleEffect(FrameEffect):
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError(f"Expected (H, W, 3) RGB frame, got {frame.shape}")
         h, w, _ = frame.shape
-        if self._shape != (h, w) or self._kernel is None or self._in_tensor is None or self._out_tensor is None:
+        if self._shape != (h, w) or self._handle is None or self._in_tensor is None or self._out_tensor is None:
             self.setup(w, h, ctx.fps if ctx else 30.0)
 
         flat = np.ascontiguousarray(frame, dtype=np.uint8).reshape(-1)
         with self._in_tensor.overwrite() as dst:
             np.copyto(dst, flat)
 
-        self._kernel(
-            self._in_tensor,
-            self._out_tensor,
-            k_total_bytes=self._total_bytes,
-            k_workers=self._num_workers,
-            k_tile_pixels=self._tile_pixels,
-            k_tile_bytes=self._tile_pixels * 3,
-            k_chunks=self._total_bytes // (self._num_workers * self._tile_pixels * 3),
-        )
+        self._runtime.run(self._handle, [self._in_tensor, self._out_tensor])
         return self._out_tensor.numpy().reshape(h, w, 3).copy()
 
     def teardown(self) -> None:
+        self._handle = None
+        self._runtime = None
         self._kernel = None
         self._in_tensor = None
         self._out_tensor = None

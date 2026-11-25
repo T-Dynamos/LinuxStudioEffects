@@ -1,6 +1,7 @@
 """Reusable NPU1 (AIE2) bfloat16 MatMul executor built on MLIR-AIE / IRON."""
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -138,30 +139,58 @@ def _compile_matmul_4col(m: int, k: int, n: int) -> Any:
 
 
 class NpuMatMulExecutor:
-    """Manages compiled IRON bf16 MatMul kernels and persistent NPU weight/IO buffers."""
+    """Manages compiled IRON bf16 MatMul handles and persistent NPU weight/IO buffers."""
+
+    # npu1 hardware-context limit in CachedHRXRuntime is 6; bound live handles to 4
+    # so fused-QKV ViT layers stay resident without hitting EINVAL across model reloads.
+    _MAX_HANDLE_CACHE = 4
 
     def __init__(self) -> None:
-        self._kernels: dict[tuple[int, int, int], Any] = {}
+        self._designs: dict[tuple[int, int, int], Any] = {}
+        self._handles: OrderedDict[tuple[int, int, int], Any] = OrderedDict()
         self._io_cache: dict[tuple[int, int, int], tuple[Any, Any, Any]] = {}
+        self._last_a_dims: dict[tuple[int, int, int], tuple[int, int]] = {}
         self._weight_cache: dict[tuple[int, int, int], Any] = {}
+        self._runtime: Any = None
         self.stats = NpuExecStats()
 
     def reset_stats(self) -> None:
         self.stats = NpuExecStats()
 
-    def _get_kernel_and_io(self, m: int, k: int, n: int) -> tuple[Any, Any, Any, Any]:
+    def _get_exec(self, m: int, k: int, n: int) -> tuple[Any, Any, Any, Any, Any]:
         import aie.iron as iron
+        from aie.utils import DefaultNPURuntime
+
+        if self._runtime is None:
+            self._runtime = DefaultNPURuntime
 
         key = (m, k, n)
-        if key not in self._kernels:
-            self._kernels[key] = _compile_matmul_4col(m, k, n)
         if key not in self._io_cache:
             t_a = iron.zeros((m, k), dtype=bfloat16, device="npu")
             t_b = iron.zeros((k, n), dtype=bfloat16, device="npu")
             t_c = iron.zeros((m, n), dtype=bfloat16, device="npu")
             self._io_cache[key] = (t_a, t_b, t_c)
         t_a, t_b, t_c = self._io_cache[key]
-        return self._kernels[key], t_a, t_b, t_c
+
+        if key not in self._designs:
+            design = _compile_matmul_4col(m, k, n)
+            # Warmup once on zero buffers so CallableDesign compiles and populates _kernel_cache.
+            design(t_a, t_b, t_c, dim_m=m, dim_k=k, dim_n=n)
+            self._designs[key] = design
+
+        handle = self._handles.get(key)
+        if handle is not None:
+            self._handles.move_to_end(key)
+        else:
+            while len(self._handles) >= self._MAX_HANDLE_CACHE:
+                _, old_handle = self._handles.popitem(last=False)
+                del old_handle
+            design = self._designs[key]
+            npu_kernel = next(iter(design._kernel_cache.values()))
+            handle = self._runtime.load(npu_kernel)
+            self._handles[key] = handle
+
+        return self._runtime, handle, t_a, t_b, t_c
 
     def _get_weight_tensor(self, b_mat: np.ndarray, k_pad: int, n_pad: int) -> Any:
         import aie.iron as iron
@@ -196,27 +225,30 @@ class NpuMatMulExecutor:
             rem = m - row
             chunk_m = min(rem, _MAX_M_PER_CALL)
             m_pad = _align_up(chunk_m, _NCOLS * _TM)
+            key = (m_pad, k_pad, n_pad)
 
-            kernel, t_a, t_b_tmp, t_c = self._get_kernel_and_io(m_pad, k_pad, n_pad)
+            rt, handle, t_a, t_b_tmp, t_c = self._get_exec(m_pad, k_pad, n_pad)
 
             t0 = time.perf_counter()
-            a_pad = np.zeros((m_pad, k_pad), dtype=bfloat16)
-            a_pad[:chunk_m, :k] = a[row : row + chunk_m].astype(bfloat16)
+            cur_dims = (chunk_m, k)
+            prev_dims = self._last_a_dims.get(key)
             with t_a.overwrite() as dst_a:
-                np.copyto(dst_a, a_pad)
+                if prev_dims is not None and prev_dims != cur_dims:
+                    dst_a.fill(0)
+                dst_a[:chunk_m, :k] = a[row : row + chunk_m].astype(bfloat16)
+            self._last_a_dims[key] = cur_dims
 
             if t_b_cached is not None:
                 t_b = t_b_cached
             else:
-                b_pad = np.zeros((k_pad, n_pad), dtype=bfloat16)
-                b_pad[:k, :n] = b.astype(bfloat16)
                 with t_b_tmp.overwrite() as dst_b:
-                    np.copyto(dst_b, b_pad)
+                    dst_b.fill(0)
+                    dst_b[:k, :n] = b.astype(bfloat16)
                 t_b = t_b_tmp
             self.stats.host_copy_s += time.perf_counter() - t0
 
             t1 = time.perf_counter()
-            kernel(t_a, t_b, t_c, dim_m=m_pad, dim_k=k_pad, dim_n=n_pad)
+            rt.run(handle, [t_a, t_b, t_c])
             self.stats.npu_wall_s += time.perf_counter() - t1
             self.stats.dispatches += 1
 
@@ -229,5 +261,8 @@ class NpuMatMulExecutor:
 
     def close(self) -> None:
         self._weight_cache.clear()
+        self._last_a_dims.clear()
         self._io_cache.clear()
-        self._kernels.clear()
+        self._handles.clear()
+        self._designs.clear()
+        self._runtime = None

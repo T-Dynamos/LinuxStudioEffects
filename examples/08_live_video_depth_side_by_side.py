@@ -10,12 +10,17 @@ Supports:
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import time
 from typing import Iterator
+
+# Prevent OpenBLAS/OMP from spawning 16 busy-wait threads that saturate CPU cores while waiting on NPU sync.
+for _blas_env in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_blas_env, "2")
 
 import numpy as np
 

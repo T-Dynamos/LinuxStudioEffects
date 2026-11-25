@@ -27,6 +27,8 @@ from linux_studio_effects.video import (
     pick_default_loopback,
     resize_rgb,
 )
+from linux_studio_effects.video.pipeline import _colorimetry_signature
+from linux_studio_effects.video.virtual_cam import VirtualCameraConfig
 
 
 class VideoPipelineUnitTests(unittest.TestCase):
@@ -59,6 +61,16 @@ class VideoPipelineUnitTests(unittest.TestCase):
         self.assertEqual(frame.shape, (2, 2, 4))
         self.assertEqual(frame.tobytes(), bytes((1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18)))
         self.assertIs(resize_native(frame, 4, 2, "YUYV"), frame)
+
+    def test_colorimetry_resolves_loopback_default_fields(self) -> None:
+        camera = CameraConfig(colorspace=8, ycbcr_enc=1, quantization=0, xfer_func=1)
+        loopback = VirtualCameraConfig(colorspace=8, ycbcr_enc=0, quantization=0, xfer_func=0)
+        self.assertEqual(_colorimetry_signature(camera, "YUYV"), _colorimetry_signature(loopback, "YUYV"))
+
+        incompatible = VirtualCameraConfig(colorspace=3, ycbcr_enc=0, quantization=0, xfer_func=0)
+        self.assertNotEqual(_colorimetry_signature(camera, "YUYV"), _colorimetry_signature(incompatible, "YUYV"))
+        incompatible_range = VirtualCameraConfig(colorspace=8, ycbcr_enc=1, quantization=1, xfer_func=0)
+        self.assertNotEqual(_colorimetry_signature(camera, "YUYV"), _colorimetry_signature(incompatible_range, "YUYV"))
 
     def test_resize_rgb_cover_and_stretch(self) -> None:
         # 1280x720 image with bright white center stripe and black sides.

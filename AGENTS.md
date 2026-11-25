@@ -22,7 +22,9 @@
 
 - The live `VideoPipeline` path does not convert between color spaces. It
   captures native `YUYV`, `UYVY`, `RGB3`, or `BGR3` frames and writes the same
-  format to the output. Input/output FourCC and V4L2 colorimetry must match.
+  format to the output. Input/output FourCC, colorspace, YCbCr encoding, and
+  quantization range must match after resolving V4L2 default values. Drivers
+  may canonicalize transfer-function metadata to DEFAULT.
 - Use `video/pixels.py` for packed-frame layout, YUYV/UYVY plane access, and
   same-format resizing. A YUYV/UYVY array has shape `(height, width // 2, 4)`;
   RGB3/BGR3 has shape `(height, width, 3)`. Packed 4:2:2 widths must be even.

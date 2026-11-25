@@ -45,8 +45,10 @@ The camera frame enters the graph, graph nodes can consume the camera or an
 earlier node, and the selected output continues through the pipeline to the
 virtual camera. Live capture carries packed `YUYV`, `UYVY`, `RGB3`, or `BGR3`
 frames through this path unchanged. The camera and loopback must negotiate the
-same FourCC and colorimetry; the pipeline does not decode or convert between
-color spaces. Output resizing operates on the original packed format.
+same FourCC, colorspace, YCbCr encoding, and quantization range; V4L2 default
+values are resolved before comparison because loopback drivers may report
+defaults instead of explicit fields. The pipeline does not decode or convert
+between color spaces. Output resizing operates on the original packed format.
 
 ```mermaid
 flowchart LR

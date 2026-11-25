@@ -54,6 +54,29 @@ class PipelineStats:
     cpu_percent: float
 
 
+def _colorimetry_signature(config: CameraConfig | VirtualCameraConfig, pixel_format: str) -> tuple[int, int, int]:
+    """Resolve V4L2 default YCbCr/range values for the same native format.
+
+    v4l2loopback commonly reports XFER_FUNC_DEFAULT even when it was asked to
+    preserve the capture device's explicit transfer-function value. The encoded
+    YCbCr matrix and quantization range are the fields that determine how these
+    unchanged packed YUV bytes are interpreted by V4L2 consumers.
+    """
+    colorspace = config.colorspace
+    ycbcr_enc = config.ycbcr_enc
+    if ycbcr_enc == 0:
+        ycbcr_enc = {
+            2: 8,  # SMPTE 240M
+            3: 2,  # Rec. 709
+            10: 6,  # BT.2020
+            12: 2,  # DCI-P3
+        }.get(colorspace, 1)  # Default for SRGB/SMPTE170M/JPEG/etc. is 601.
+    quantization = config.quantization
+    if quantization == 0:
+        quantization = 1 if pixel_format in {"RGB3", "BGR3"} or colorspace == 7 else 2
+    return colorspace, ycbcr_enc, quantization
+
+
 class VideoPipeline:
     """Streams frames from a physical V4L2 camera into a v4l2loopback virtual camera."""
 
@@ -140,21 +163,12 @@ class VideoPipeline:
                 xfer_func=cam.negotiated.xfer_func,
             )
             vcam = stack.enter_context(VirtualCameraOutput(out_cfg))
-            in_colorimetry = (
-                cam.negotiated.colorspace,
-                cam.negotiated.ycbcr_enc,
-                cam.negotiated.quantization,
-                cam.negotiated.xfer_func,
-            )
-            out_colorimetry = (
-                vcam.negotiated.colorspace,
-                vcam.negotiated.ycbcr_enc,
-                vcam.negotiated.quantization,
-                vcam.negotiated.xfer_func,
-            )
+            in_colorimetry = _colorimetry_signature(cam.negotiated, input_format)
+            out_colorimetry = _colorimetry_signature(vcam.negotiated, output_format)
             if in_colorimetry != out_colorimetry:
                 raise RuntimeError(
-                    f"Input/output colorimetry differs ({in_colorimetry} != {out_colorimetry}); "
+                    f"Input/output colorspace, YCbCr encoding, or quantization differs "
+                    f"({in_colorimetry} != {out_colorimetry}); "
                     "color conversion is disabled"
                 )
             self._negotiated_in = cam.negotiated

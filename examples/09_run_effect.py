@@ -149,9 +149,9 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="List effects and implemented backends")
     parser.add_argument("--effect", choices=sorted(catalog), default="mirror")
     parser.add_argument("--device", choices=("auto", "cpu", "gpu", "npu"), default="auto")
-    parser.add_argument("--in-size", type=_size, help="Camera input size; default is its largest advertised mode")
+    parser.add_argument("--in-size", type=_size, help="Camera input size; defaults to 1920x1080 when available")
     parser.add_argument("--out-size", type=_size, help="Virtual camera output size; default matches input")
-    parser.add_argument("--fps", type=float, help="Frame rate; default is the largest mode's advertised maximum")
+    parser.add_argument("--fps", type=float, help="Frame rate; default request is 30 fps")
     parser.add_argument("--frames", type=int, default=0, help="Process synthetic frames without camera hardware")
     parser.add_argument("--duration", type=float, default=0.0, help="Live run duration; 0 runs until Ctrl+C")
     parser.add_argument("--variant", choices=("small", "base", "large"), default="small", help="Depth model variant")
@@ -214,9 +214,12 @@ def main() -> int:
             f"Camera {camera} has no uncompressed mode{requested} shared with the output formats "
             f"{', '.join(effect_formats)}. Color conversion is disabled."
         )
+    preferred_size = args.in_size or (1920, 1080)
     selected_mode = max(
         compatible_modes,
         key=lambda mode: (
+            (mode.width, mode.height) == preferred_size,
+            max(mode.fps_options, default=0.0) >= 29.5,
             mode.width * mode.height,
             max(mode.fps_options, default=0.0),
             mode.pixel_format == "YUYV",
@@ -224,8 +227,7 @@ def main() -> int:
     )
     input_width, input_height = selected_mode.width, selected_mode.height
     input_format = selected_mode.pixel_format
-    mode_fps = max(selected_mode.fps_options, default=30.0)
-    fps = args.fps or mode_fps
+    fps = args.fps if args.fps is not None else 30.0
     output_width, output_height = args.out_size or (input_width, input_height)
     if is_yuv422(input_format) and output_width % 2:
         parser.error(f"{input_format} requires an even output width")

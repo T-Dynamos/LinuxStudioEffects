@@ -308,6 +308,9 @@ class VideoDepthAnythingModel:
         self._frame_id: int = -1
         self._frame_id_list: list[int] = []
         self._frame_cache_list: list[tuple[tuple[np.ndarray, np.ndarray], ...]] = []
+        # Preallocated rolling (d, 32, ch) K/V buffers per temporal attention slot
+        self._kv_work: list[tuple[np.ndarray, np.ndarray]] = []
+        self._slot1_id: int | None = None
 
         if self.backend == "npu":
             self._npu_mm = NpuMatMulExecutor()
@@ -319,6 +322,8 @@ class VideoDepthAnythingModel:
         self._frame_id = -1
         self._frame_id_list.clear()
         self._frame_cache_list.clear()
+        self._kv_work.clear()
+        self._slot1_id = None
 
     def _init_torch_gpu(self) -> None:
         import torch  # type: ignore[import-not-found]
@@ -450,11 +455,12 @@ class VideoDepthAnythingModel:
 
     def _run_temporal_attn(
         self,
+        slot: int,
         x_dc: np.ndarray,
         actx: _TemporalAttnCtx,
-        cached_kv: tuple[np.ndarray, np.ndarray] | None,
+        has_history: bool,
     ) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
-        """Algebraically exact KV-factorized streaming temporal self-attention."""
+        """Algebraically exact KV-factorized streaming temporal self-attention with rolling buffers."""
         d, ch = x_dc.shape
         n_heads = self.config.temporal_heads
         dh = ch // n_heads
@@ -463,17 +469,38 @@ class VideoDepthAnythingModel:
         kv_cur = x_dc @ actx.w_kv_t
         k_cur_raw, v_cur_raw = np.split(kv_cur, 2, axis=-1)  # each (d, ch)
 
-        if cached_kv is None:
+        while len(self._kv_work) <= slot:
+            self._kv_work.append(
+                (
+                    np.empty((d, _INFER_LEN, ch), dtype=np.float32),
+                    np.empty((d, _INFER_LEN, ch), dtype=np.float32),
+                )
+            )
+        k_buf, v_buf = self._kv_work[slot]
+        if k_buf.shape[0] != d or k_buf.shape[2] != ch:
+            k_buf = np.empty((d, _INFER_LEN, ch), dtype=np.float32)
+            v_buf = np.empty((d, _INFER_LEN, ch), dtype=np.float32)
+            self._kv_work[slot] = (k_buf, v_buf)
+
+        if not has_history:
             q = (x_dc + actx.pe[0]) @ actx.w_q_t  # (d, ch)
             k = (k_cur_raw + actx.k_pe[0])[:, None, :]  # (d, 1, ch)
             v = (v_cur_raw + actx.v_pe[0])[:, None, :]  # (d, 1, ch)
             t_len = 1
+            k_buf[:, : _INFER_LEN - 1, :] = k_cur_raw[:, None, :]
+            v_buf[:, : _INFER_LEN - 1, :] = v_cur_raw[:, None, :]
         else:
-            k_hist, v_hist = cached_kv  # each (d, 31, ch)
-            q = (x_dc + actx.pe[k_hist.shape[1]]) @ actx.w_q_t  # (d, ch)
-            k = np.concatenate([k_hist, k_cur_raw[:, None, :]], axis=1) + actx.k_pe[None, : k_hist.shape[1] + 1, :]
-            v = np.concatenate([v_hist, v_cur_raw[:, None, :]], axis=1) + actx.v_pe[None, : v_hist.shape[1] + 1, :]
-            t_len = k.shape[1]
+            q = (x_dc + actx.pe[_INFER_LEN - 1]) @ actx.w_q_t  # (d, ch)
+            k_buf[:, _INFER_LEN - 1, :] = k_cur_raw
+            v_buf[:, _INFER_LEN - 1, :] = v_cur_raw
+            k = k_buf + actx.k_pe[None, :, :]
+            v = v_buf + actx.v_pe[None, :, :]
+            t_len = _INFER_LEN
+            # Shift rolling [-29:] window in-place for the next streaming frame
+            k_buf[:, 2 : _INFER_LEN - 2, :] = k_buf[:, 3 : _INFER_LEN - 1, :]
+            k_buf[:, _INFER_LEN - 2, :] = k_cur_raw
+            v_buf[:, 2 : _INFER_LEN - 2, :] = v_buf[:, 3 : _INFER_LEN - 1, :]
+            v_buf[:, _INFER_LEN - 2, :] = v_cur_raw
 
         qh = q.reshape(d, n_heads, 1, dh)
         kh = k.reshape(d, t_len, n_heads, dh).transpose(0, 2, 3, 1)
@@ -489,7 +516,7 @@ class VideoDepthAnythingModel:
         feat_nchw: np.ndarray,
         mctx: _MotionCtx,
         slot_offset: int,
-        cur_cache: list[tuple[np.ndarray, np.ndarray]] | None,
+        has_history: bool,
     ) -> tuple[np.ndarray, tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]]:
         _, ch, h, w = feat_nchw.shape
         d = h * w
@@ -506,12 +533,10 @@ class VideoDepthAnythingModel:
         tokens = np.ascontiguousarray(x[0].transpose(1, 2, 0).reshape(d, ch))
         hs = tokens @ mctx.proj_in_wt + mctx.proj_in_b
 
-        c0 = cur_cache[slot_offset] if cur_cache is not None else None
-        out0, kv0 = self._run_temporal_attn(_layer_norm(hs, mctx.attn0_nw, mctx.attn0_nb, eps), mctx.attn0, c0)
+        out0, kv0 = self._run_temporal_attn(slot_offset, _layer_norm(hs, mctx.attn0_nw, mctx.attn0_nb, eps), mctx.attn0, has_history)
         hs = hs + out0
 
-        c1 = cur_cache[slot_offset + 1] if cur_cache is not None else None
-        out1, kv1 = self._run_temporal_attn(_layer_norm(hs, mctx.attn1_nw, mctx.attn1_nb, eps), mctx.attn1, c1)
+        out1, kv1 = self._run_temporal_attn(slot_offset + 1, _layer_norm(hs, mctx.attn1_nw, mctx.attn1_nb, eps), mctx.attn1, has_history)
         hs = hs + out1
 
         ff_in = _layer_norm(hs, mctx.ff_nw, mctx.ff_nb, eps)
@@ -542,17 +567,15 @@ class VideoDepthAnythingModel:
         cfg = self.config
         w = self.weights
 
-        # Prepare stacked temporal cache if stream history is initialized
-        cur_cache: list[tuple[np.ndarray, np.ndarray]] | None = None
-        if self._frame_cache_list:
-            cur_list = self._frame_cache_list[0:2] + self._frame_cache_list[-(_INFER_LEN - 3) :]
-            cur_cache = [
-                (
-                    np.stack([h[slot][0] for h in cur_list], axis=1),
-                    np.stack([h[slot][1] for h in cur_list], axis=1),
-                )
-                for slot in range(8)
-            ]
+        has_history = bool(self._frame_cache_list)
+        if has_history:
+            slot1 = self._frame_cache_list[1]
+            if id(slot1) != self._slot1_id and len(self._kv_work) >= 8:
+                for slot in range(8):
+                    k_buf, v_buf = self._kv_work[slot]
+                    k_buf[:, 1, :] = slot1[slot][0]
+                    v_buf[:, 1, :] = slot1[slot][1]
+                self._slot1_id = id(slot1)
 
         # 1. Projects + Resize
         reassembled: list[np.ndarray] = []
@@ -587,8 +610,8 @@ class VideoDepthAnythingModel:
         layer_1, layer_2, layer_3, layer_4 = reassembled
 
         # 2. Temporal modules 0 and 1 on layer_3 and layer_4
-        layer_3, kv_m0 = self._run_motion_module(layer_3, self._motion_ctxs[0], 0, cur_cache)
-        layer_4, kv_m1 = self._run_motion_module(layer_4, self._motion_ctxs[1], 2, cur_cache)
+        layer_3, kv_m0 = self._run_motion_module(layer_3, self._motion_ctxs[0], 0, has_history)
+        layer_4, kv_m1 = self._run_motion_module(layer_4, self._motion_ctxs[1], 2, has_history)
 
         # 3. Scratch 3x3 projections (no bias)
         f = cfg.fusion_hidden_size
@@ -602,14 +625,14 @@ class VideoDepthAnythingModel:
         path_4 = self._residual_unit(layer_4_rn, rf4.res2)
         path_4 = _bilinear_resize_nchw(path_4, layer_3_rn.shape[2], layer_3_rn.shape[3], align_corners=True)
         path_4 = _conv2d_nchw(path_4, self._conv_wt(rf4.out_conv_weight), rf4.out_conv_bias, c_out=f)
-        path_4, kv_m2 = self._run_motion_module(path_4, self._motion_ctxs[2], 4, cur_cache)
+        path_4, kv_m2 = self._run_motion_module(path_4, self._motion_ctxs[2], 4, has_history)
 
         # 5. RefineNet3 + MotionModule 3
         rf3 = w.refinenets[2]
         path_3 = self._residual_unit(path_4 + self._residual_unit(layer_3_rn, rf3.res1), rf3.res2)
         path_3 = _bilinear_resize_nchw(path_3, layer_2_rn.shape[2], layer_2_rn.shape[3], align_corners=True)
         path_3 = _conv2d_nchw(path_3, self._conv_wt(rf3.out_conv_weight), rf3.out_conv_bias, c_out=f)
-        path_3, kv_m3 = self._run_motion_module(path_3, self._motion_ctxs[3], 6, cur_cache)
+        path_3, kv_m3 = self._run_motion_module(path_3, self._motion_ctxs[3], 6, has_history)
 
         # 6. RefineNet2 & RefineNet1
         rf2 = w.refinenets[1]

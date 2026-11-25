@@ -46,3 +46,8 @@ Run any example from the repository root using `iron-env/bin/python` (or any Pyt
    ```bash
    ./iron-env/bin/python examples/07_video_depth_benchmark.py --variants small --input-size 252 --real-weights
    ```
+
+8. **[08_live_video_depth_side_by_side.py](08_live_video_depth_side_by_side.py)** — Fastest streaming Video Depth Anything `Small` side-by-side (`[Input Video | Depth Map]`) live preview / `/dev/video4` / MP4 output.
+   ```bash
+   ./iron-env/bin/python examples/08_live_video_depth_side_by_side.py --input-size 140 --preview
+   ```

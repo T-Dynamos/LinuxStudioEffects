@@ -31,14 +31,13 @@ from linux_studio_effects.video import (
     VideoPipeline,
     ZoomCropEffect,
     check_camera_deps,
+    create_effect,
     pick_default_loopback,
     resolve_compute_device,
 )
 
 
 class _LifecycleTrackerEffect(FrameEffect):
-    supported_devices = (ComputeDevice.CPU,)
-
     def __init__(self) -> None:
         super().__init__(device=ComputeDevice.AUTO)
         self.setup_calls: list[tuple[int, int, float]] = []
@@ -62,12 +61,17 @@ class EffectsUnitTests(unittest.TestCase):
     """Tests for ComputeDevice resolution, FrameEffect lifecycle, EffectChain, and CPU effects."""
 
     def test_compute_device_resolution(self) -> None:
-        self.assertEqual(resolve_compute_device("auto", (ComputeDevice.CPU,)), ComputeDevice.CPU)
-        self.assertEqual(resolve_compute_device(ComputeDevice.CPU, (ComputeDevice.CPU,)), ComputeDevice.CPU)
+        self.assertEqual(resolve_compute_device("mirror", "auto"), "cpu")
+        self.assertEqual(resolve_compute_device("mirror", "cpu"), "cpu")
         with self.assertRaises(DeviceUnavailableError):
-            resolve_compute_device(ComputeDevice.NPU, (ComputeDevice.CPU,))
+            resolve_compute_device("mirror", "npu")
         with self.assertRaises(DeviceUnavailableError):
-            resolve_compute_device(ComputeDevice.GPU, (ComputeDevice.CPU,))
+            resolve_compute_device("mirror", "gpu")
+
+    def test_auto_effect_factory_uses_discovered_backend(self) -> None:
+        effect = create_effect("mirror")
+        self.assertEqual(effect.name, "mirror")
+        self.assertEqual(effect.active_device.value, "cpu")
 
     def test_callable_effect_and_disabled_skip(self) -> None:
         def invert(frame: np.ndarray) -> np.ndarray:
@@ -164,12 +168,9 @@ class EffectsUnitTests(unittest.TestCase):
         self.assertIs(CpuPass, PassthroughEffect)
         self.assertIs(CpuSpot, SpotlightEffect)
         self.assertIs(CpuZoom, ZoomCropEffect)
-        self.assertEqual(CpuPortraitBlur.supported_devices, (ComputeDevice.CPU,))
-        self.assertEqual(CpuVideoDepth.supported_devices, (ComputeDevice.CPU,))
-        self.assertEqual(NpuPortraitBlur.supported_devices, (ComputeDevice.NPU,))
-        self.assertEqual(NpuVideoDepth.supported_devices, (ComputeDevice.NPU,))
-        self.assertEqual(GpuVideoDepth.supported_devices, (ComputeDevice.GPU,))
-        self.assertEqual(NpuGrey.supported_devices, (ComputeDevice.NPU,))
+        self.assertEqual(CpuPortraitBlur.effect_name, "portrait_blur")
+        self.assertEqual(CpuVideoDepth.effect_name, "video_depth")
+        self.assertEqual(NpuGrey.effect_name, "greyscale")
         self.assertEqual(CpuBlur().name, "fast_blur")
         self.assertEqual(CpuMirror().name, "mirror")
         self.assertEqual(CpuPass().name, "passthrough")
@@ -180,7 +181,7 @@ class EffectsUnitTests(unittest.TestCase):
         self.assertEqual(CpuVideoDepth.effect_name, NpuVideoDepth.effect_name)
         self.assertEqual(CpuPortraitBlur.__name__, NpuPortraitBlur.__name__)
         self.assertEqual(CpuPortraitBlur.effect_name, NpuPortraitBlur.effect_name)
-        from linux_studio_effects.video.effects import available_effect_backends
+        from linux_studio_effects.video import available_effect_backends
         self.assertEqual(available_effect_backends()["video_depth"], ("cpu", "gpu", "npu"))
         self.assertEqual(available_effect_backends()["greyscale"], ("npu",))
 

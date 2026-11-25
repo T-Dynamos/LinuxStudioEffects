@@ -9,7 +9,6 @@ from ...models.video_depth_anything.effect_base import VideoDepthEffectBase
 class VideoDepthEffect(VideoDepthEffectBase):
     """Runs streaming Video Depth Anything (Small/Base/Large) on CPU via NumPy/OpenBLAS."""
 
-    supported_devices = (ComputeDevice.CPU,)
     effect_name = "video_depth"
 
     def __init__(self, *, device: ComputeDevice | str = ComputeDevice.CPU, **kwargs: object) -> None:

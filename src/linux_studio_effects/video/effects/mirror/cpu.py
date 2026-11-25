@@ -10,7 +10,6 @@ from ..base import ComputeDevice, FrameContext, FrameEffect
 class MirrorEffect(FrameEffect):
     """Horizontally mirror the frame (natural webcam self-view)."""
 
-    supported_devices = (ComputeDevice.CPU,)
     effect_name = "mirror"
 
     def process(self, frame: np.ndarray, ctx: FrameContext | None = None) -> np.ndarray:

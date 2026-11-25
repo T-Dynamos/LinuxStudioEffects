@@ -1,11 +1,15 @@
-"""Video frame effects organized by execution backend (cpu, npu, gpu)."""
+"""Video frame effects organized by effect, with optional backend modules."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from importlib import import_module
-from pathlib import Path
-
+from ..backend import (
+    available_effect_backends,
+    create_effect,
+    is_device_available,
+    load_effect_backend,
+    resolve_compute_device,
+)
 from .base import (
     CallableEffect,
     ComputeDevice,
@@ -15,19 +19,14 @@ from .base import (
     FrameContext,
     FrameEffect,
     as_frame_effect,
-    is_device_available,
-    resolve_compute_device,
 )
 from .fast_blur.cpu import FastBlurEffect
 from .greyscale.npu import GreyscaleEffect
 from .mirror.cpu import MirrorEffect
 from .passthrough.cpu import PassthroughEffect
 from .portrait_blur.cpu import PortraitBlurEffect
-from .portrait_blur.npu import PortraitBlurEffect as _NpuPortraitBlurEffect
 from .spotlight.cpu import SpotlightEffect
 from .video_depth.cpu import VideoDepthEffect
-from .video_depth.gpu import VideoDepthEffect as _GpuVideoDepthEffect
-from .video_depth.npu import VideoDepthEffect as _NpuVideoDepthEffect
 from .zoom_crop.cpu import ZoomCropEffect
 
 BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
@@ -36,37 +35,18 @@ BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "zoom": ZoomCropEffect,
     "spotlight": SpotlightEffect,
     "blur": FastBlurEffect,
-    "greyscale": GreyscaleEffect,
-    "depth_cpu": VideoDepthEffect,
-    "depth_npu": _NpuVideoDepthEffect,
-    "video_depth_cpu": VideoDepthEffect,
-    "video_depth_npu": _NpuVideoDepthEffect,
-    "portrait_blur_cpu": PortraitBlurEffect,
-    "portrait_blur_npu": _NpuPortraitBlurEffect,
+    "greyscale": lambda: create_effect("greyscale"),
+    "depth_cpu": lambda: create_effect("video_depth", device="cpu"),
+    "depth_npu": lambda: create_effect("video_depth", device="npu"),
+    "video_depth_cpu": lambda: create_effect("video_depth", device="cpu"),
+    "video_depth_npu": lambda: create_effect("video_depth", device="npu"),
+    "portrait_blur_cpu": lambda: create_effect("portrait_blur", device="cpu"),
+    "portrait_blur_npu": lambda: create_effect("portrait_blur", device="npu"),
 }
-
-
-def available_effect_backends() -> dict[str, tuple[str, ...]]:
-    """List implemented backends by effect; a missing backend file is skipped."""
-    root = Path(__file__).parent
-    return {
-        effect.name: tuple(backend for backend in ("cpu", "gpu", "npu") if (effect / f"{backend}.py").is_file())
-        for effect in sorted(root.iterdir())
-        if effect.is_dir() and effect.name not in {"cpu", "gpu", "npu"} and (effect / "__init__.py").is_file()
-    }
-
-
-def load_effect_backend(effect: str, backend: str):
-    """Import a backend implementation on demand, raising ImportError if absent."""
-    if backend not in {"cpu", "gpu", "npu"}:
-        raise ValueError(f"Unknown backend {backend!r}")
-    module_path = Path(__file__).parent / effect / f"{backend}.py"
-    if not module_path.is_file():
-        raise ImportError(f"Effect {effect!r} has no {backend!r} implementation")
-    return import_module(f"{__name__}.{effect}.{backend}")
 
 __all__ = [
     "BUILTIN_EFFECTS",
+    "create_effect",
     "available_effect_backends",
     "load_effect_backend",
     "CallableEffect",

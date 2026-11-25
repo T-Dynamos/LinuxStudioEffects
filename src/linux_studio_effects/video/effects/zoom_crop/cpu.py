@@ -10,7 +10,6 @@ from ..base import ComputeDevice, FrameContext, FrameEffect
 class ZoomCropEffect(FrameEffect):
     """Center-crop zoom on CPU (simulates framing crop before resize)."""
 
-    supported_devices = (ComputeDevice.CPU,)
     effect_name = "zoom_crop"
 
     def __init__(self, zoom: float = 1.25, **kwargs: object) -> None:

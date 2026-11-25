@@ -1,6 +1,7 @@
 """Video and camera studio effects capture pipeline."""
 
 from .benchmark import CameraBenchmarkResult, benchmark_camera, format_benchmark_result
+from .backend import create_effect
 from .camera import CameraConfig, CapturedFrame, V4L2Camera
 from .capabilities import (
     CameraCapabilitiesSummary,
@@ -60,6 +61,7 @@ from .virtual_cam import (
 __all__ = [
     "ActiveStreamFormat",
     "BUILTIN_EFFECTS",
+    "create_effect",
     "CallableEffect",
     "CameraBenchmarkResult",
     "CameraCapabilitiesSummary",

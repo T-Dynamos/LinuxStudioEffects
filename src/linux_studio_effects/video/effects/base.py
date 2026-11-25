@@ -1,8 +1,7 @@
-"""Device-agnostic frame-in -> frame-out effect interface and backend resolution."""
+"""Device-agnostic frame-in -> frame-out effect interfaces."""
 
 from __future__ import annotations
 
-import importlib.util
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -35,72 +34,9 @@ class FrameContext:
     fps: float
 
 
-def _is_npu_available() -> bool:
-    try:
-        from ...npu import probe_npu
-
-        return probe_npu().available
-    except Exception:
-        return False
-
-
-def _is_gpu_available() -> bool:
-    if importlib.util.find_spec("torch") is None:
-        return False
-    try:
-        import torch  # type: ignore[import-not-found]
-
-        if torch.cuda.is_available():
-            return True
-        xpu = getattr(torch, "xpu", None)
-        return bool(xpu is not None and xpu.is_available())
-    except Exception:
-        return False
-
-
-def is_device_available(device: ComputeDevice | str) -> bool:
-    """Return True if the requested compute backend is usable on this host."""
-    dev = ComputeDevice(device.lower()) if isinstance(device, str) else device
-    if dev == ComputeDevice.CPU:
-        return True
-    if dev == ComputeDevice.NPU:
-        return _is_npu_available()
-    if dev == ComputeDevice.GPU:
-        return _is_gpu_available()
-    if dev == ComputeDevice.AUTO:
-        return True
-    return False
-
-
-def resolve_compute_device(
-    requested: ComputeDevice | str,
-    supported: tuple[ComputeDevice, ...],
-) -> ComputeDevice:
-    """Resolve 'auto' or validate an explicit ComputeDevice against effect capabilities."""
-    req = ComputeDevice(requested.lower()) if isinstance(requested, str) else requested
-    if not supported:
-        raise DeviceUnavailableError("Effect declares no supported compute devices")
-
-    if req == ComputeDevice.AUTO:
-        for candidate in (ComputeDevice.NPU, ComputeDevice.GPU, ComputeDevice.CPU):
-            if candidate in supported and is_device_available(candidate):
-                return candidate
-        raise DeviceUnavailableError(f"None of supported devices {[d.value for d in supported]} are available")
-
-    if req not in supported:
-        raise DeviceUnavailableError(
-            f"Requested device '{req.value}' is not supported by this effect "
-            f"(supported: {[d.value for d in supported]})"
-        )
-    if not is_device_available(req):
-        raise DeviceUnavailableError(f"Requested device '{req.value}' is not available on this host")
-    return req
-
-
 class FrameEffect(ABC):
     """Base interface for a frame-in -> frame-out video processor on CPU, NPU, or GPU."""
 
-    supported_devices: tuple[ComputeDevice, ...] = (ComputeDevice.CPU,)
     effect_name: str | None = None
 
     def __init__(
@@ -112,7 +48,15 @@ class FrameEffect(ABC):
     ) -> None:
         self.name = name or self.effect_name or type(self).__name__
         self.requested_device = ComputeDevice(device.lower()) if isinstance(device, str) else device
-        self.active_device = resolve_compute_device(self.requested_device, self.supported_devices)
+        from ..backend import resolve_compute_device
+
+        self.active_device = ComputeDevice(
+            resolve_compute_device(
+                self.effect_name,
+                self.requested_device.value,
+                implementation_module=type(self).__module__,
+            )
+        )
         self.enabled = enabled
         self._is_setup = False
 
@@ -137,8 +81,6 @@ class FrameEffect(ABC):
 class CallableEffect(FrameEffect):
     """Wrap any plain ``fn(frame) -> frame`` callable into a FrameEffect."""
 
-    supported_devices = (ComputeDevice.CPU,)
-
     def __init__(
         self,
         fn: Callable[[np.ndarray], np.ndarray],
@@ -162,8 +104,6 @@ class CallableEffect(FrameEffect):
 
 class EffectChain(FrameEffect):
     """Compose multiple FrameEffects sequentially with shared lifecycle management."""
-
-    supported_devices = (ComputeDevice.NPU, ComputeDevice.GPU, ComputeDevice.CPU)
 
     def __init__(
         self,

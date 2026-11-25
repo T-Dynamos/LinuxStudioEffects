@@ -10,10 +10,9 @@ from ..base import ComputeDevice, FrameContext, FrameEffect
 class FastBlurEffect(FrameEffect):
     """Fast CPU downsampled separable box blur (useful baseline before NPU blur)."""
 
-    supported_devices = (ComputeDevice.CPU,)
     effect_name = "fast_blur"
 
-    def __init__(self, scale: int = 4, passes: int = 2, **kwargs: object) -> None:
+    def __init__(self, scale: int = 4, passes: int = 10, **kwargs: object) -> None:
         if scale < 1 or passes < 1:
             raise ValueError("scale and passes must be >= 1")
         super().__init__(**kwargs)  # type: ignore[arg-type]

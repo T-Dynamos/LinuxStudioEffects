@@ -24,7 +24,9 @@ LinuxStudioEffects/
 Effects are grouped by behavior under `video/effects/<effect>/`. A backend is
 implemented only when its file exists (`cpu.py`, `gpu.py`, or `npu.py`); use
 `available_effect_backends()` to inspect the catalog and `load_effect_backend()`
-to import a backend lazily. Shared model code remains under `video/models/`.
+to import a backend lazily. `create_effect("video_depth")` selects the best
+implemented backend available on the host (NPU, then GPU, then CPU). Shared
+model code remains under `video/models/`.
 
 `FrameGraph` lets a node consume the camera frame (`input`) or a prior node's
 output, and its selected output is passed to the existing virtual-camera sink:

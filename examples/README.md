@@ -51,3 +51,11 @@ Run any example from the repository root using `iron-env/bin/python` (or any Pyt
    ```bash
    ./iron-env/bin/python examples/08_live_video_depth_side_by_side.py --input-size 140 --preview
    ```
+
+9. **[09_run_effect.py](09_run_effect.py)** — Run any discovered effect/backend on the live camera at its largest advertised resolution and write to `/dev/video4` by default. Configure camera and virtual-camera sizes independently with `--in-size` and `--out-size`. Use `--list` to inspect effect folders, or `--frames 5` for an optional synthetic-frame check. Depth effects use synthetic weights unless `--real-weights` is given.
+   ```bash
+   ./iron-env/bin/python examples/09_run_effect.py --list
+   ./iron-env/bin/python examples/09_run_effect.py --effect mirror
+   ./iron-env/bin/python examples/09_run_effect.py --effect mirror --in-size 2592x1944 --out-size 1920x1080
+   ./iron-env/bin/python examples/09_run_effect.py --effect video_depth --device auto
+   ```

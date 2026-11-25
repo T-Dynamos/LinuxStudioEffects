@@ -28,8 +28,6 @@ from linux_studio_effects.video.effects.spotlight.cpu import SpotlightEffect
 class WarmTintEffect(FrameEffect):
     """Example custom FrameEffect showing setup/process/teardown with device selection."""
 
-    supported_devices = (ComputeDevice.CPU,)
-
     def __init__(self, warmth: float = 0.12, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.warmth = warmth

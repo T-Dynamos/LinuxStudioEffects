@@ -23,6 +23,11 @@ _OVERLAP = 10
 _INTERP_LEN = 8
 _GAP = (_INFER_LEN - _OVERLAP) * 2 - 1 - (_OVERLAP - _INTERP_LEN)  # 41
 
+# Crossover thresholds measured on NPU1 (4x4 bf16->f32 with N_align=128) vs AVX-512 OpenBLAS:
+# below these sizes, NPU dispatch + N=128 alignment padding outweighs compute savings.
+_NPU_LINEAR_MIN_MACS = 120_000_000
+_NPU_CONV_MIN_MACS = 250_000_000
+
 
 @dataclass(frozen=True)
 class InferenceResult:
@@ -264,6 +269,7 @@ class VideoDepthAnythingModel:
         self._pos_embed_cache: dict[tuple[int, int], np.ndarray] = {}
         self._wt_cache: dict[int, np.ndarray] = {}
         self._conv_wt_cache: dict[int, np.ndarray] = {}
+        self._conv_kykxc_wt_cache: dict[int, np.ndarray] = {}
         self._deconv_wt_cache: dict[int, np.ndarray] = {}
         self._motion_ctxs: tuple[_MotionCtx, ...] = tuple(_build_motion_ctx(m) for m in weights.motion_modules)
         self._torch_ctx: dict[str, Any] | None = None
@@ -338,6 +344,15 @@ class VideoDepthAnythingModel:
             self._conv_wt_cache[wid] = w2
         return w2
 
+    def _conv_kykxc_wt(self, w4: np.ndarray) -> np.ndarray:
+        wid = id(w4)
+        w2 = self._conv_kykxc_wt_cache.get(wid)
+        if w2 is None:
+            c_out, c_in, kh, kw = w4.shape
+            w2 = np.ascontiguousarray(w4.transpose(2, 3, 1, 0).reshape(kh * kw * c_in, c_out))
+            self._conv_kykxc_wt_cache[wid] = w2
+        return w2
+
     def _deconv_wt(self, w4: np.ndarray) -> np.ndarray:
         wid = id(w4)
         w2 = self._deconv_wt_cache.get(wid)
@@ -346,6 +361,67 @@ class VideoDepthAnythingModel:
             w2 = np.ascontiguousarray(w4.reshape(c_in, c_out * kh * kw).T)
             self._deconv_wt_cache[wid] = w2
         return w2
+
+    def _proj(
+        self,
+        x: np.ndarray,
+        wt: np.ndarray,
+        bias: np.ndarray | None = None,
+        *,
+        activation: str | None = None,
+    ) -> np.ndarray:
+        """Linear projection taking pre-transposed weight (K, N), routing heavy layers to NPU."""
+        m, k = x.shape
+        _, n = wt.shape
+        if self._npu_mm is not None and n >= 128 and m * k * n >= _NPU_LINEAR_MIN_MACS:
+            return self._npu_mm.matmul(x, wt, bias=bias, activation=activation, cache_b=True)
+        y = x @ wt
+        if bias is not None:
+            y = y + bias
+        if activation == "gelu":
+            return host_ops.gelu_inplace(y)
+        return y
+
+    def _conv2d(
+        self,
+        x: np.ndarray,
+        w4: np.ndarray,
+        bias: np.ndarray | None = None,
+        *,
+        stride: int = 1,
+        padding: int = 0,
+        apply_relu: bool = False,
+    ) -> np.ndarray:
+        """Conv2d wrapper routing high-FLOP 3x3 s=1 p=1 and 1x1 convolutions (C_out >= 128) to NPU."""
+        _, c_in, h, w = x.shape
+        c_out, _, kh, kw = w4.shape
+        w_mat = self._conv_wt(w4)
+
+        if self._npu_mm is not None and stride == 1 and c_out >= 128:
+            macs = c_out * c_in * kh * kw * h * w
+            if kh == 3 and kw == 3 and padding == 1 and macs >= _NPU_CONV_MIN_MACS:
+                return self._npu_mm.conv2d_3x3_s1_p1_nchw(
+                    x,
+                    self._conv_kykxc_wt(w4),
+                    self._wt(w_mat),
+                    bias=bias,
+                    apply_relu=apply_relu,
+                )
+            if kh == 1 and kw == 1 and padding == 0 and macs >= _NPU_CONV_MIN_MACS:
+                return self._npu_mm.matmul(
+                    x.reshape(c_in, h * w),
+                    self._wt(w_mat),
+                    bias=bias,
+                    activation="relu" if apply_relu else None,
+                    cache_b=True,
+                    transpose_a=True,
+                    out_nchw_hw=(h, w),
+                )
+
+        out = _conv2d_nchw(x, w_mat, bias, c_out=c_out, kh=kh, kw=kw, stride=stride, padding=padding)
+        if apply_relu:
+            return np.maximum(out, np.float32(0.0))
+        return out
 
     def _linear(
         self,
@@ -436,10 +512,11 @@ class VideoDepthAnythingModel:
         d, ch = x_dc.shape
         n_heads = self.config.temporal_heads
         dh = ch // n_heads
-        scale = np.float32(1.0 / math.sqrt(dh))
+        scale = float(1.0 / math.sqrt(dh))
 
-        kv_cur = x_dc @ actx.w_kv_t
-        k_cur_raw, v_cur_raw = np.split(kv_cur, 2, axis=-1)  # each (d, ch)
+        kv_cur = self._proj(x_dc, actx.w_kv_t)
+        k_cur_raw = np.ascontiguousarray(kv_cur[:, :ch])
+        v_cur_raw = np.ascontiguousarray(kv_cur[:, ch:])
 
         while len(self._kv_work) <= slot:
             self._kv_work.append(
@@ -455,33 +532,35 @@ class VideoDepthAnythingModel:
             self._kv_work[slot] = (k_buf, v_buf)
 
         if not has_history:
-            q = (x_dc + actx.pe[0]) @ actx.w_q_t  # (d, ch)
-            k = (k_cur_raw + actx.k_pe[0])[:, None, :]  # (d, 1, ch)
-            v = (v_cur_raw + actx.v_pe[0])[:, None, :]  # (d, 1, ch)
-            t_len = 1
-            k_buf[:, : _INFER_LEN - 1, :] = k_cur_raw[:, None, :]
-            v_buf[:, : _INFER_LEN - 1, :] = v_cur_raw[:, None, :]
+            attn_out = host_ops.temporal_attn_roll(
+                k_cur_raw,
+                k_cur_raw,
+                v_cur_raw,
+                k_buf,
+                v_buf,
+                actx.k_pe,
+                actx.v_pe,
+                n_heads,
+                scale,
+                False,
+            )
         else:
-            q = (x_dc + actx.pe[_INFER_LEN - 1]) @ actx.w_q_t  # (d, ch)
-            k_buf[:, _INFER_LEN - 1, :] = k_cur_raw
-            v_buf[:, _INFER_LEN - 1, :] = v_cur_raw
-            k = k_buf + actx.k_pe[None, :, :]
-            v = v_buf + actx.v_pe[None, :, :]
-            t_len = _INFER_LEN
-            # Shift rolling [-29:] window in-place for the next streaming frame
-            k_buf[:, 2 : _INFER_LEN - 2, :] = k_buf[:, 3 : _INFER_LEN - 1, :]
-            k_buf[:, _INFER_LEN - 2, :] = k_cur_raw
-            v_buf[:, 2 : _INFER_LEN - 2, :] = v_buf[:, 3 : _INFER_LEN - 1, :]
-            v_buf[:, _INFER_LEN - 2, :] = v_cur_raw
+            q = np.ascontiguousarray(self._proj(x_dc + actx.pe[_INFER_LEN - 1], actx.w_q_t))
+            attn_out = host_ops.temporal_attn_roll(
+                q,
+                k_cur_raw,
+                v_cur_raw,
+                k_buf,
+                v_buf,
+                actx.k_pe,
+                actx.v_pe,
+                n_heads,
+                scale,
+                True,
+            )
 
-        qh = q.reshape(d, n_heads, 1, dh)
-        kh = k.reshape(d, t_len, n_heads, dh).transpose(0, 2, 3, 1)
-        vh = v.reshape(d, t_len, n_heads, dh).transpose(0, 2, 1, 3)
-
-        attn = _softmax(np.matmul(qh, kh) * scale)
-        out = np.matmul(attn, vh).reshape(d, ch)
-        out = out @ actx.w_out_t + actx.b_out
-        return out, (np.ascontiguousarray(k_cur_raw), np.ascontiguousarray(v_cur_raw))
+        out = self._proj(attn_out, actx.w_out_t, actx.b_out)
+        return out, (k_cur_raw, v_cur_raw)
 
     def _run_motion_module(
         self,
@@ -503,7 +582,7 @@ class VideoDepthAnythingModel:
             eps=self.config.group_norm_eps,
         )
         tokens = np.ascontiguousarray(x[0].transpose(1, 2, 0).reshape(d, ch))
-        hs = tokens @ mctx.proj_in_wt + mctx.proj_in_b
+        hs = self._proj(tokens, mctx.proj_in_wt, mctx.proj_in_b)
 
         out0, kv0 = self._run_temporal_attn(slot_offset, _layer_norm(hs, mctx.attn0_nw, mctx.attn0_nb, eps), mctx.attn0, has_history)
         hs = hs + out0
@@ -512,22 +591,20 @@ class VideoDepthAnythingModel:
         hs = hs + out1
 
         ff_in = _layer_norm(hs, mctx.ff_nw, mctx.ff_nb, eps)
-        ff_proj = ff_in @ mctx.ff_proj_wt + mctx.ff_proj_b
+        ff_proj = self._proj(ff_in, mctx.ff_proj_wt, mctx.ff_proj_b)
         ff_val, ff_gate = np.split(ff_proj, 2, axis=-1)
-        ff_out = (ff_val * _gelu(ff_gate)) @ mctx.ff_out_wt + mctx.ff_out_b
+        ff_in_out = np.ascontiguousarray(ff_val * _gelu(ff_gate))
+        ff_out = self._proj(ff_in_out, mctx.ff_out_wt, mctx.ff_out_b)
         hs = hs + ff_out
 
-        out_tokens = hs @ mctx.proj_out_wt + mctx.proj_out_b
+        out_tokens = self._proj(hs, mctx.proj_out_wt, mctx.proj_out_b)
         out_nchw = out_tokens.reshape(1, h, w, ch).transpose(0, 3, 1, 2)
         return np.ascontiguousarray(out_nchw + residual, dtype=np.float32), (kv0, kv1)
 
     def _residual_unit(self, x: np.ndarray, rcw: Any) -> np.ndarray:
-        c1 = rcw.conv1_weight.shape[0]
-        c2 = rcw.conv2_weight.shape[0]
-        h = np.maximum(x, 0.0)
-        h = _conv2d_nchw(h, self._conv_wt(rcw.conv1_weight), rcw.conv1_bias, c_out=c1, kh=3, kw=3, stride=1, padding=1)
-        h = np.maximum(h, 0.0)
-        h = _conv2d_nchw(h, self._conv_wt(rcw.conv2_weight), rcw.conv2_bias, c_out=c2, kh=3, kw=3, stride=1, padding=1)
+        h = np.maximum(x, np.float32(0.0))
+        h = self._conv2d(h, rcw.conv1_weight, rcw.conv1_bias, stride=1, padding=1, apply_relu=True)
+        h = self._conv2d(h, rcw.conv2_weight, rcw.conv2_bias, stride=1, padding=1)
         return x + h
 
     def _forward_temporal_dpt(
@@ -586,45 +663,40 @@ class VideoDepthAnythingModel:
         layer_4, kv_m1 = self._run_motion_module(layer_4, self._motion_ctxs[1], 2, has_history)
 
         # 3. Scratch 3x3 projections (no bias)
-        f = cfg.fusion_hidden_size
-        layer_1_rn = _conv2d_nchw(layer_1, self._conv_wt(w.layer_rn_weights[0]), None, c_out=f, kh=3, kw=3, padding=1)
-        layer_2_rn = _conv2d_nchw(layer_2, self._conv_wt(w.layer_rn_weights[1]), None, c_out=f, kh=3, kw=3, padding=1)
-        layer_3_rn = _conv2d_nchw(layer_3, self._conv_wt(w.layer_rn_weights[2]), None, c_out=f, kh=3, kw=3, padding=1)
-        layer_4_rn = _conv2d_nchw(layer_4, self._conv_wt(w.layer_rn_weights[3]), None, c_out=f, kh=3, kw=3, padding=1)
+        layer_1_rn = self._conv2d(layer_1, w.layer_rn_weights[0], None, padding=1)
+        layer_2_rn = self._conv2d(layer_2, w.layer_rn_weights[1], None, padding=1)
+        layer_3_rn = self._conv2d(layer_3, w.layer_rn_weights[2], None, padding=1)
+        layer_4_rn = self._conv2d(layer_4, w.layer_rn_weights[3], None, padding=1)
 
         # 4. RefineNet4 + MotionModule 2
         rf4 = w.refinenets[3]
         path_4 = self._residual_unit(layer_4_rn, rf4.res2)
         path_4 = _bilinear_resize_nchw(path_4, layer_3_rn.shape[2], layer_3_rn.shape[3], align_corners=True)
-        path_4 = _conv2d_nchw(path_4, self._conv_wt(rf4.out_conv_weight), rf4.out_conv_bias, c_out=f)
+        path_4 = self._conv2d(path_4, rf4.out_conv_weight, rf4.out_conv_bias)
         path_4, kv_m2 = self._run_motion_module(path_4, self._motion_ctxs[2], 4, has_history)
 
         # 5. RefineNet3 + MotionModule 3
         rf3 = w.refinenets[2]
         path_3 = self._residual_unit(path_4 + self._residual_unit(layer_3_rn, rf3.res1), rf3.res2)
         path_3 = _bilinear_resize_nchw(path_3, layer_2_rn.shape[2], layer_2_rn.shape[3], align_corners=True)
-        path_3 = _conv2d_nchw(path_3, self._conv_wt(rf3.out_conv_weight), rf3.out_conv_bias, c_out=f)
+        path_3 = self._conv2d(path_3, rf3.out_conv_weight, rf3.out_conv_bias)
         path_3, kv_m3 = self._run_motion_module(path_3, self._motion_ctxs[3], 6, has_history)
 
         # 6. RefineNet2 & RefineNet1
         rf2 = w.refinenets[1]
         path_2 = self._residual_unit(path_3 + self._residual_unit(layer_2_rn, rf2.res1), rf2.res2)
         path_2 = _bilinear_resize_nchw(path_2, layer_1_rn.shape[2], layer_1_rn.shape[3], align_corners=True)
-        path_2 = _conv2d_nchw(path_2, self._conv_wt(rf2.out_conv_weight), rf2.out_conv_bias, c_out=f)
+        path_2 = self._conv2d(path_2, rf2.out_conv_weight, rf2.out_conv_bias)
 
         rf1 = w.refinenets[0]
         path_1 = self._residual_unit(path_2 + self._residual_unit(layer_1_rn, rf1.res1), rf1.res2)
         path_1 = _bilinear_resize_nchw(path_1, path_1.shape[2] * 2, path_1.shape[3] * 2, align_corners=True)
-        path_1 = _conv2d_nchw(path_1, self._conv_wt(rf1.out_conv_weight), rf1.out_conv_bias, c_out=f)
+        path_1 = self._conv2d(path_1, rf1.out_conv_weight, rf1.out_conv_bias)
 
         # 7. Output head
-        c1 = f // 2
-        out = _conv2d_nchw(path_1, self._conv_wt(w.output_conv1_weight), w.output_conv1_bias, c_out=c1, kh=3, kw=3, padding=1)
+        out = self._conv2d(path_1, w.output_conv1_weight, w.output_conv1_bias, padding=1)
         out = _bilinear_resize_nchw(out, ph * cfg.patch_size, pw * cfg.patch_size, align_corners=True)
-        out = np.maximum(
-            _conv2d_nchw(out, self._conv_wt(w.output_conv2_0_weight), w.output_conv2_0_bias, c_out=cfg.head_hidden_size, kh=3, kw=3, padding=1),
-            0.0,
-        )
+        out = self._conv2d(out, w.output_conv2_0_weight, w.output_conv2_0_bias, padding=1, apply_relu=True)
         out = np.maximum(
             _conv2d_nchw(out, self._conv_wt(w.output_conv2_2_weight), w.output_conv2_2_bias, c_out=1),
             0.0,
@@ -682,5 +754,6 @@ class VideoDepthAnythingModel:
         self._torch_ctx = None
         self._wt_cache.clear()
         self._conv_wt_cache.clear()
+        self._conv_kykxc_wt_cache.clear()
         self._deconv_wt_cache.clear()
         self._pos_embed_cache.clear()

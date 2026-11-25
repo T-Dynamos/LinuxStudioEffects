@@ -916,3 +916,474 @@ void bokeh_composite_u8(
         out[idx + 2] = (uint8_t)((128 + l0[idx + 2] * w0 + l1[idx + 2] * w1 + l2[idx + 2] * w2 + l3[idx + 2] * w3) >> 8);
     }
 }
+
+void f32_unpad_bias_gelu(
+    const float *src,
+    int64_t src_stride_elems,
+    float *dst,
+    int64_t dst_stride_elems,
+    const float *bias,
+    int64_t rows,
+    int64_t cols,
+    int apply_gelu
+) {
+    for (int64_t r = 0; r < rows; ++r) {
+        const float *srow = src + r * src_stride_elems;
+        float *drow = dst + r * dst_stride_elems;
+        int64_t c = 0;
+        for (; c + 16 <= cols; c += 16) {
+            __m512 v = _mm512_loadu_ps(srow + c);
+            if (bias) {
+                v = _mm512_add_ps(v, _mm512_loadu_ps(bias + c));
+            }
+            if (apply_gelu) {
+                v = gelu_vec_avx512(v);
+            }
+            _mm512_storeu_ps(drow + c, v);
+        }
+        if (c < cols) {
+            __mmask16 km = (__mmask16)((1u << (cols - c)) - 1u);
+            __m512 v = _mm512_maskz_loadu_ps(km, srow + c);
+            if (bias) {
+                v = _mm512_add_ps(v, _mm512_maskz_loadu_ps(km, bias + c));
+            }
+            if (apply_gelu) {
+                v = gelu_vec_avx512(v);
+            }
+            _mm512_mask_storeu_ps(drow + c, km, v);
+        }
+    }
+}
+
+static inline void transpose_8x16_f32_to_bf16_strided(
+    const float *src,
+    int64_t src_stride_elems,
+    uint16_t *dst,
+    int64_t dst_stride_elems
+) {
+    /*
+     * Reads 8 rows (r=0..7) x 16 cols (c=0..15) of float32, converts to bf16, and stores
+     * transposed 16 rows x 8 cols of uint16 into dst[c * dst_stride_elems + 0..7].
+     */
+    __m256i v0 = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + 0 * src_stride_elems));
+    __m256i v1 = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + 1 * src_stride_elems));
+    __m256i v2 = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + 2 * src_stride_elems));
+    __m256i v3 = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + 3 * src_stride_elems));
+    __m256i v4 = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + 4 * src_stride_elems));
+    __m256i v5 = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + 5 * src_stride_elems));
+    __m256i v6 = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + 6 * src_stride_elems));
+    __m256i v7 = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(src + 7 * src_stride_elems));
+
+    __m256i t0 = _mm256_unpacklo_epi16(v0, v1);
+    __m256i t1 = _mm256_unpackhi_epi16(v0, v1);
+    __m256i t2 = _mm256_unpacklo_epi16(v2, v3);
+    __m256i t3 = _mm256_unpackhi_epi16(v2, v3);
+    __m256i t4 = _mm256_unpacklo_epi16(v4, v5);
+    __m256i t5 = _mm256_unpackhi_epi16(v4, v5);
+    __m256i t6 = _mm256_unpacklo_epi16(v6, v7);
+    __m256i t7 = _mm256_unpackhi_epi16(v6, v7);
+
+    __m256i u0 = _mm256_unpacklo_epi32(t0, t2);
+    __m256i u1 = _mm256_unpackhi_epi32(t0, t2);
+    __m256i u2 = _mm256_unpacklo_epi32(t1, t3);
+    __m256i u3 = _mm256_unpackhi_epi32(t1, t3);
+    __m256i u4 = _mm256_unpacklo_epi32(t4, t6);
+    __m256i u5 = _mm256_unpackhi_epi32(t4, t6);
+    __m256i u6 = _mm256_unpacklo_epi32(t5, t7);
+    __m256i u7 = _mm256_unpackhi_epi32(t5, t7);
+
+    __m256i w0 = _mm256_unpacklo_epi64(u0, u4);
+    __m256i w1 = _mm256_unpackhi_epi64(u0, u4);
+    __m256i w2 = _mm256_unpacklo_epi64(u1, u5);
+    __m256i w3 = _mm256_unpackhi_epi64(u1, u5);
+    __m256i w4 = _mm256_unpacklo_epi64(u2, u6);
+    __m256i w5 = _mm256_unpackhi_epi64(u2, u6);
+    __m256i w6 = _mm256_unpacklo_epi64(u3, u7);
+    __m256i w7 = _mm256_unpackhi_epi64(u3, u7);
+
+    _mm_storeu_si128((__m128i *)(dst + 0 * dst_stride_elems), _mm256_castsi256_si128(w0));
+    _mm_storeu_si128((__m128i *)(dst + 1 * dst_stride_elems), _mm256_castsi256_si128(w1));
+    _mm_storeu_si128((__m128i *)(dst + 2 * dst_stride_elems), _mm256_castsi256_si128(w2));
+    _mm_storeu_si128((__m128i *)(dst + 3 * dst_stride_elems), _mm256_castsi256_si128(w3));
+    _mm_storeu_si128((__m128i *)(dst + 4 * dst_stride_elems), _mm256_castsi256_si128(w4));
+    _mm_storeu_si128((__m128i *)(dst + 5 * dst_stride_elems), _mm256_castsi256_si128(w5));
+    _mm_storeu_si128((__m128i *)(dst + 6 * dst_stride_elems), _mm256_castsi256_si128(w6));
+    _mm_storeu_si128((__m128i *)(dst + 7 * dst_stride_elems), _mm256_castsi256_si128(w7));
+    _mm_storeu_si128((__m128i *)(dst + 8 * dst_stride_elems), _mm256_extracti128_si256(w0, 1));
+    _mm_storeu_si128((__m128i *)(dst + 9 * dst_stride_elems), _mm256_extracti128_si256(w1, 1));
+    _mm_storeu_si128((__m128i *)(dst + 10 * dst_stride_elems), _mm256_extracti128_si256(w2, 1));
+    _mm_storeu_si128((__m128i *)(dst + 11 * dst_stride_elems), _mm256_extracti128_si256(w3, 1));
+    _mm_storeu_si128((__m128i *)(dst + 12 * dst_stride_elems), _mm256_extracti128_si256(w4, 1));
+    _mm_storeu_si128((__m128i *)(dst + 13 * dst_stride_elems), _mm256_extracti128_si256(w5, 1));
+    _mm_storeu_si128((__m128i *)(dst + 14 * dst_stride_elems), _mm256_extracti128_si256(w6, 1));
+    _mm_storeu_si128((__m128i *)(dst + 15 * dst_stride_elems), _mm256_extracti128_si256(w7, 1));
+}
+
+void f32_transpose_to_bf16_pad(
+    const float *src,
+    int64_t src_stride_elems,
+    uint16_t *dst,
+    int64_t dst_stride_elems,
+    int64_t dst_rows,
+    int64_t dst_cols,
+    int64_t src_rows,
+    int64_t src_cols,
+    int zero_tail
+) {
+    /*
+     * src has shape (src_rows=K, src_cols=M); dst has shape (dst_rows=M_pad, dst_cols=K_pad).
+     * Writes dst[m, k] = bf16(src[k, m]) using AVX-512 8x16 register transposes.
+     */
+    const int64_t out_rows = src_cols;
+    const int64_t out_cols = src_rows;
+    const size_t tail_bytes = (dst_cols > out_cols) ? (size_t)(dst_cols - out_cols) * sizeof(uint16_t) : 0;
+
+    int64_t m0 = 0;
+    for (; m0 + 16 <= out_rows; m0 += 16) {
+        int64_t k0 = 0;
+        for (; k0 + 8 <= out_cols; k0 += 8) {
+            transpose_8x16_f32_to_bf16_strided(
+                src + k0 * src_stride_elems + m0,
+                src_stride_elems,
+                dst + m0 * dst_stride_elems + k0,
+                dst_stride_elems
+            );
+        }
+        if (k0 < out_cols) {
+            const int64_t bk = out_cols - k0;
+            uint16_t tile[8][16];
+            for (int64_t kk = 0; kk < bk; ++kk) {
+                __m512 vf = _mm512_loadu_ps(src + (k0 + kk) * src_stride_elems + m0);
+                __m256bh vb = _mm512_cvtneps_pbh(vf);
+                _mm256_storeu_si256((__m256i *)tile[kk], (__m256i)vb);
+            }
+            for (int64_t mm = 0; mm < 16; ++mm) {
+                uint16_t *drow = dst + (m0 + mm) * dst_stride_elems + k0;
+                for (int64_t kk = 0; kk < bk; ++kk) {
+                    drow[kk] = tile[kk][mm];
+                }
+            }
+        }
+        if (tail_bytes) {
+            for (int64_t mm = 0; mm < 16; ++mm) {
+                memset(dst + (m0 + mm) * dst_stride_elems + out_cols, 0, tail_bytes);
+            }
+        }
+    }
+
+    if (m0 < out_rows) {
+        const int64_t bm = out_rows - m0;
+        uint16_t tile[16][16];
+        for (int64_t k0 = 0; k0 < out_cols; k0 += 16) {
+            const int64_t bk = (out_cols - k0 < 16) ? (out_cols - k0) : 16;
+            const __mmask16 km = (__mmask16)((1u << bm) - 1u);
+            for (int64_t kk = 0; kk < bk; ++kk) {
+                __m512 vf = _mm512_maskz_loadu_ps(km, src + (k0 + kk) * src_stride_elems + m0);
+                __m256bh vb = _mm512_cvtneps_pbh(vf);
+                _mm256_mask_storeu_epi16(tile[kk], km, (__m256i)vb);
+            }
+            for (int64_t mm = 0; mm < bm; ++mm) {
+                uint16_t *drow = dst + (m0 + mm) * dst_stride_elems + k0;
+                for (int64_t kk = 0; kk < bk; ++kk) {
+                    drow[kk] = tile[kk][mm];
+                }
+            }
+        }
+        if (tail_bytes) {
+            for (int64_t mm = 0; mm < bm; ++mm) {
+                memset(dst + (m0 + mm) * dst_stride_elems + out_cols, 0, tail_bytes);
+            }
+        }
+    }
+
+    if (zero_tail && dst_rows > out_rows) {
+        if (dst_stride_elems == dst_cols) {
+            memset(
+                dst + out_rows * dst_stride_elems,
+                0,
+                (size_t)(dst_rows - out_rows) * (size_t)dst_cols * sizeof(uint16_t)
+            );
+        } else {
+            for (int64_t r = out_rows; r < dst_rows; ++r) {
+                memset(dst + r * dst_stride_elems, 0, (size_t)dst_cols * sizeof(uint16_t));
+            }
+        }
+    }
+}
+
+int im2col_3x3_s1_p1_kykxc_bf16_pad(
+    const float *x_nchw,
+    uint16_t *dst_mk,
+    int64_t dst_stride_elems,
+    int64_t dst_rows,
+    int64_t dst_cols,
+    int64_t c_in,
+    int64_t h,
+    int64_t w,
+    int zero_tail
+) {
+    /*
+     * Converts (1, c_in, h, w) float32 -> temporary (h, w, c_in) bf16, then streams 3x3 s=1 p=1
+     * patches directly into dst_mk[(h*w)_pad, (9*c_in)_pad] with K ordered as (ky, kx, c_in).
+     */
+    const int64_t hw = h * w;
+    const int64_t k_elems = 9 * c_in;
+    uint16_t *hwc = (uint16_t *)malloc((size_t)hw * (size_t)c_in * sizeof(uint16_t));
+    if (!hwc) {
+        return -1;
+    }
+
+    f32_transpose_to_bf16_pad(x_nchw, hw, hwc, c_in, hw, c_in, c_in, hw, 0);
+
+    const size_t c_bytes = (size_t)c_in * sizeof(uint16_t);
+    const size_t span3_bytes = 3 * c_bytes;
+    const size_t k_tail_bytes = (dst_cols > k_elems) ? (size_t)(dst_cols - k_elems) * sizeof(uint16_t) : 0;
+
+    for (int64_t y = 0; y < h; ++y) {
+        for (int64_t x = 0; x < w; ++x) {
+            uint16_t *drow = dst_mk + (y * w + x) * dst_stride_elems;
+            for (int64_t ky = 0; ky < 3; ++ky) {
+                const int64_t sy = y + ky - 1;
+                uint16_t *dk = drow + ky * 3 * c_in;
+                if (sy < 0 || sy >= h) {
+                    memset(dk, 0, span3_bytes);
+                } else {
+                    const uint16_t *s_row = hwc + sy * w * c_in;
+                    if (x > 0 && x + 1 < w) {
+                        memcpy(dk, s_row + (x - 1) * c_in, span3_bytes);
+                    } else {
+                        if (x > 0) {
+                            memcpy(dk, s_row + (x - 1) * c_in, c_bytes);
+                        } else {
+                            memset(dk, 0, c_bytes);
+                        }
+                        memcpy(dk + c_in, s_row + x * c_in, c_bytes);
+                        if (x + 1 < w) {
+                            memcpy(dk + 2 * c_in, s_row + (x + 1) * c_in, c_bytes);
+                        } else {
+                            memset(dk + 2 * c_in, 0, c_bytes);
+                        }
+                    }
+                }
+            }
+            if (k_tail_bytes) {
+                memset(drow + k_elems, 0, k_tail_bytes);
+            }
+        }
+    }
+
+    if (zero_tail && dst_rows > hw) {
+        if (dst_stride_elems == dst_cols) {
+            memset(
+                dst_mk + hw * dst_stride_elems,
+                0,
+                (size_t)(dst_rows - hw) * (size_t)dst_cols * sizeof(uint16_t)
+            );
+        } else {
+            for (int64_t r = hw; r < dst_rows; ++r) {
+                memset(dst_mk + r * dst_stride_elems, 0, (size_t)dst_cols * sizeof(uint16_t));
+            }
+        }
+    }
+
+    free(hwc);
+    return 0;
+}
+
+void f32_unpad_transpose_bias_relu(
+    const float *src,
+    int64_t src_stride_elems,
+    float *dst_nchw,
+    const float *bias,
+    int64_t m_hw,
+    int64_t c_out,
+    int apply_relu
+) {
+    /*
+     * Transposes (M, C_out) -> (C_out, M) float32 in 64x16 cache blocks with optional
+     * vector bias addition and ReLU before storing contiguous channel rows.
+     */
+    const __m512 vzero = _mm512_setzero_ps();
+    float tile[64][16];
+
+    for (int64_t c0 = 0; c0 < c_out; c0 += 16) {
+        const int64_t bc = (c_out - c0 < 16) ? (c_out - c0) : 16;
+        __mmask16 km = (bc == 16) ? (__mmask16)0xFFFFu : (__mmask16)((1u << bc) - 1u);
+        __m512 vbias = bias ? ((bc == 16) ? _mm512_loadu_ps(bias + c0) : _mm512_maskz_loadu_ps(km, bias + c0)) : vzero;
+
+        for (int64_t m0 = 0; m0 < m_hw; m0 += 64) {
+            const int64_t bm = (m_hw - m0 < 64) ? (m_hw - m0) : 64;
+            for (int64_t mm = 0; mm < bm; ++mm) {
+                const float *srow = src + (m0 + mm) * src_stride_elems + c0;
+                __m512 v = (bc == 16) ? _mm512_loadu_ps(srow) : _mm512_maskz_loadu_ps(km, srow);
+                if (bias) {
+                    v = _mm512_add_ps(v, vbias);
+                }
+                if (apply_relu) {
+                    v = _mm512_max_ps(v, vzero);
+                }
+                _mm512_storeu_ps(tile[mm], v);
+            }
+            for (int64_t cc = 0; cc < bc; ++cc) {
+                float *drow = dst_nchw + (c0 + cc) * m_hw + m0;
+                for (int64_t mm = 0; mm < bm; ++mm) {
+                    drow[mm] = tile[mm][cc];
+                }
+            }
+        }
+    }
+}
+
+void temporal_attn_roll_f32(
+    const float *q,
+    const float *k_cur,
+    const float *v_cur,
+    float *k_buf,
+    float *v_buf,
+    const float *k_pe,
+    const float *v_pe,
+    float *out,
+    int64_t d,
+    int64_t t_len,
+    int64_t n_heads,
+    int64_t dh,
+    float scale,
+    int has_history
+) {
+    const int64_t ch = n_heads * dh;
+
+    if (!has_history) {
+        const size_t ch_bytes = (size_t)ch * sizeof(float);
+        for (int64_t tok = 0; tok < d; ++tok) {
+            const float *kc = k_cur + tok * ch;
+            const float *vc = v_cur + tok * ch;
+            float *out_tok = out + tok * ch;
+            int64_t c = 0;
+            for (; c + 16 <= ch; c += 16) {
+                __m512 vv = _mm512_add_ps(_mm512_loadu_ps(vc + c), _mm512_loadu_ps(v_pe + c));
+                _mm512_storeu_ps(out_tok + c, vv);
+            }
+            if (c < ch) {
+                __mmask16 km = (__mmask16)((1u << (ch - c)) - 1u);
+                __m512 vv = _mm512_add_ps(_mm512_maskz_loadu_ps(km, vc + c), _mm512_maskz_loadu_ps(km, v_pe + c));
+                _mm512_mask_storeu_ps(out_tok + c, km, vv);
+            }
+            float *kb = k_buf + tok * t_len * ch;
+            float *vb = v_buf + tok * t_len * ch;
+            for (int64_t t = 0; t < t_len - 1; ++t) {
+                memcpy(kb + t * ch, kc, ch_bytes);
+                memcpy(vb + t * ch, vc, ch_bytes);
+            }
+        }
+        return;
+    }
+
+    float *scores = (t_len <= 128) ? NULL : (float *)malloc((size_t)t_len * sizeof(float));
+    float stack_scores[128];
+    float *sc = scores ? scores : stack_scores;
+
+    const size_t ch_bytes = (size_t)ch * sizeof(float);
+    const size_t shift_bytes = (t_len > 4) ? (size_t)(t_len - 4) * ch_bytes : 0;
+
+    for (int64_t tok = 0; tok < d; ++tok) {
+        const float *q_tok = q + tok * ch;
+        const float *kc = k_cur + tok * ch;
+        const float *vc = v_cur + tok * ch;
+        float *kb = k_buf + tok * t_len * ch;
+        float *vb = v_buf + tok * t_len * ch;
+        float *out_tok = out + tok * ch;
+
+        memcpy(kb + (t_len - 1) * ch, kc, ch_bytes);
+        memcpy(vb + (t_len - 1) * ch, vc, ch_bytes);
+
+        for (int64_t h = 0; h < n_heads; ++h) {
+            const int64_t h_off = h * dh;
+            const float *qh = q_tok + h_off;
+            float *oh = out_tok + h_off;
+
+            float max_sc = -3.402823466e+38f;
+            for (int64_t t = 0; t < t_len; ++t) {
+                const float *kt = kb + t * ch + h_off;
+                const float *kpet = k_pe + t * ch + h_off;
+                __m512 vacc = _mm512_setzero_ps();
+                int64_t i = 0;
+                for (; i + 16 <= dh; i += 16) {
+                    __m512 vq = _mm512_loadu_ps(qh + i);
+                    __m512 vk = _mm512_add_ps(_mm512_loadu_ps(kt + i), _mm512_loadu_ps(kpet + i));
+                    vacc = _mm512_fmadd_ps(vq, vk, vacc);
+                }
+                if (i < dh) {
+                    __mmask16 km = (__mmask16)((1u << (dh - i)) - 1u);
+                    __m512 vq = _mm512_maskz_loadu_ps(km, qh + i);
+                    __m512 vk = _mm512_add_ps(_mm512_maskz_loadu_ps(km, kt + i), _mm512_maskz_loadu_ps(km, kpet + i));
+                    vacc = _mm512_fmadd_ps(vq, vk, vacc);
+                }
+                float s = _mm512_reduce_add_ps(vacc) * scale;
+                sc[t] = s;
+                if (s > max_sc) max_sc = s;
+            }
+
+            const __m512 vmax = _mm512_set1_ps(max_sc);
+            __m512 vsum = _mm512_setzero_ps();
+            int64_t t = 0;
+            for (; t + 16 <= t_len; t += 16) {
+                __m512 ve = exp_ps_avx512(_mm512_sub_ps(_mm512_loadu_ps(sc + t), vmax));
+                _mm512_storeu_ps(sc + t, ve);
+                vsum = _mm512_add_ps(vsum, ve);
+            }
+            if (t < t_len) {
+                __mmask16 km = (__mmask16)((1u << (t_len - t)) - 1u);
+                __m512 ve = exp_ps_avx512(_mm512_sub_ps(_mm512_maskz_loadu_ps(km, sc + t), vmax));
+                _mm512_mask_storeu_ps(sc + t, km, ve);
+                vsum = _mm512_mask_add_ps(vsum, km, vsum, ve);
+            }
+            float inv_sum = 1.0f / _mm512_reduce_add_ps(vsum);
+            const __m512 vinv = _mm512_set1_ps(inv_sum);
+            for (t = 0; t + 16 <= t_len; t += 16) {
+                _mm512_storeu_ps(sc + t, _mm512_mul_ps(_mm512_loadu_ps(sc + t), vinv));
+            }
+            if (t < t_len) {
+                __mmask16 km = (__mmask16)((1u << (t_len - t)) - 1u);
+                _mm512_mask_storeu_ps(sc + t, km, _mm512_mul_ps(_mm512_maskz_loadu_ps(km, sc + t), vinv));
+            }
+
+            int64_t i = 0;
+            for (; i + 16 <= dh; i += 16) {
+                __m512 oacc = _mm512_setzero_ps();
+                for (int64_t tt = 0; tt < t_len; ++tt) {
+                    const float *vt = vb + tt * ch + h_off + i;
+                    const float *vpet = v_pe + tt * ch + h_off + i;
+                    __m512 vw = _mm512_set1_ps(sc[tt]);
+                    __m512 vv = _mm512_add_ps(_mm512_loadu_ps(vt), _mm512_loadu_ps(vpet));
+                    oacc = _mm512_fmadd_ps(vw, vv, oacc);
+                }
+                _mm512_storeu_ps(oh + i, oacc);
+            }
+            if (i < dh) {
+                __mmask16 km = (__mmask16)((1u << (dh - i)) - 1u);
+                __m512 oacc = _mm512_setzero_ps();
+                for (int64_t tt = 0; tt < t_len; ++tt) {
+                    const float *vt = vb + tt * ch + h_off + i;
+                    const float *vpet = v_pe + tt * ch + h_off + i;
+                    __m512 vw = _mm512_set1_ps(sc[tt]);
+                    __m512 vv = _mm512_add_ps(_mm512_maskz_loadu_ps(km, vt), _mm512_maskz_loadu_ps(km, vpet));
+                    oacc = _mm512_fmadd_ps(vw, vv, oacc);
+                }
+                _mm512_mask_storeu_ps(oh + i, km, oacc);
+            }
+        }
+
+        if (t_len >= 4) {
+            if (shift_bytes) {
+                memmove(kb + 2 * ch, kb + 3 * ch, shift_bytes);
+                memmove(vb + 2 * ch, vb + 3 * ch, shift_bytes);
+            }
+            memcpy(kb + (t_len - 2) * ch, kc, ch_bytes);
+            memcpy(vb + (t_len - 2) * ch, vc, ch_bytes);
+        }
+    }
+
+    if (scores) {
+        free(scores);
+    }
+}

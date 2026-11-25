@@ -209,6 +209,73 @@ def _load_c_lib() -> ctypes.CDLL | None:
     ]
     lib.bokeh_composite_u8.restype = None
 
+    lib.f32_unpad_bias_gelu.argtypes = [
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int,
+    ]
+    lib.f32_unpad_bias_gelu.restype = None
+
+    lib.f32_transpose_to_bf16_pad.argtypes = [
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        _C_U16_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int,
+    ]
+    lib.f32_transpose_to_bf16_pad.restype = None
+
+    lib.f32_unpad_transpose_bias_relu.argtypes = [
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int,
+    ]
+    lib.f32_unpad_transpose_bias_relu.restype = None
+
+    lib.temporal_attn_roll_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_float,
+        ctypes.c_int,
+    ]
+    lib.temporal_attn_roll_f32.restype = None
+
+    lib.im2col_3x3_s1_p1_kykxc_bf16_pad.argtypes = [
+        _C_FLOAT_PTR,
+        _C_U16_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int,
+    ]
+    lib.im2col_3x3_s1_p1_kykxc_bf16_pad.restype = ctypes.c_int
+
     return lib
 
 
@@ -319,6 +386,227 @@ def bf16_to_f32_unpad(
         return
 
     dst_f32[:rows, :cols] = (src[:rows, :cols].astype(np.uint32) << np.uint32(16)).view(np.float32)
+
+
+def f32_unpad_bias_gelu(
+    src_f32: np.ndarray,
+    dst_f32: np.ndarray,
+    rows: int,
+    cols: int,
+    *,
+    bias: np.ndarray | None = None,
+    apply_gelu: bool = False,
+) -> None:
+    """Copy float32 [:rows, :cols] from padded NPU output with optional bias add and GELU."""
+    if _LIB is not None and dst_f32.flags["WRITEABLE"] and src_f32.strides[1] == 4 and dst_f32.strides[1] == 4:
+        b_c = np.ascontiguousarray(bias, dtype=np.float32) if bias is not None else None
+        _LIB.f32_unpad_bias_gelu(
+            _ptr_f32(src_f32),
+            src_f32.strides[0] // 4,
+            _ptr_f32(dst_f32),
+            dst_f32.strides[0] // 4,
+            _ptr_f32(b_c) if b_c is not None else ctypes.cast(0, _C_FLOAT_PTR),
+            rows,
+            cols,
+            1 if apply_gelu else 0,
+        )
+        return
+
+    sub = src_f32[:rows, :cols]
+    if bias is not None:
+        sub = sub + bias[:cols]
+    dst_f32[:rows, :cols] = sub
+    if apply_gelu:
+        gelu_inplace(dst_f32[:rows, :cols])
+
+
+def f32_transpose_to_bf16_pad(
+    src_f32: np.ndarray,
+    dst_u16: np.ndarray,
+    src_rows: int,
+    src_cols: int,
+    zero_tail: bool = True,
+) -> None:
+    """Transpose float32 [:src_rows, :src_cols] -> dst[:src_cols, :src_rows] as padded bfloat16 uint16."""
+    src = np.asarray(src_f32, dtype=np.float32)
+    dst = dst_u16.view(np.uint16) if dst_u16.dtype != np.uint16 else dst_u16
+    if src.ndim != 2 or dst.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got src={src.ndim}D dst={dst.ndim}D")
+    dst_rows, dst_cols = dst.shape
+    if src_rows < 0 or src_cols < 0 or src_rows > src.shape[0] or src_cols > src.shape[1]:
+        raise ValueError(f"Source slice ({src_rows}, {src_cols}) out of bounds for {src.shape}")
+    if src_cols > dst_rows or src_rows > dst_cols:
+        raise ValueError(f"Destination shape {dst.shape} smaller than transposed ({src_cols}, {src_rows})")
+
+    if _LIB is not None and dst.flags["WRITEABLE"] and dst.strides[1] == 2 and dst.strides[0] % 2 == 0:
+        if src.strides[1] != 4 or src.strides[0] % 4 != 0 or src.strides[0] < src_cols * 4:
+            src = np.ascontiguousarray(src[:src_rows, :src_cols], dtype=np.float32)
+        _LIB.f32_transpose_to_bf16_pad(
+            _ptr_f32(src),
+            src.strides[0] // 4,
+            _ptr_u16(dst),
+            dst.strides[0] // 2,
+            dst_rows,
+            dst_cols,
+            src_rows,
+            src_cols,
+            1 if zero_tail else 0,
+        )
+        return
+
+    sub = np.ascontiguousarray(src[:src_rows, :src_cols].T, dtype=np.float32)
+    u32 = sub.view(np.uint32)
+    rounding_bias = np.uint32(0x7FFF) + ((u32 >> np.uint32(16)) & np.uint32(1))
+    dst[:src_cols, :src_rows] = ((u32 + rounding_bias) >> np.uint32(16)).astype(np.uint16)
+    if dst_cols > src_rows:
+        dst[:src_cols, src_rows:] = 0
+    if zero_tail and dst_rows > src_cols:
+        dst[src_cols:, :] = 0
+
+
+def f32_unpad_transpose_bias_relu(
+    src_f32: np.ndarray,
+    dst_c_hw: np.ndarray,
+    m_hw: int,
+    c_out: int,
+    *,
+    bias: np.ndarray | None = None,
+    apply_relu: bool = False,
+) -> None:
+    """Transpose (M, C_out) float32 NPU output into contiguous (C_out, M) with optional bias and ReLU."""
+    if dst_c_hw.dtype != np.float32 or not dst_c_hw.flags["C_CONTIGUOUS"] or dst_c_hw.size != c_out * m_hw:
+        raise ValueError("dst_c_hw must be C-contiguous float32 matching (c_out, m_hw)")
+
+    if _LIB is not None and dst_c_hw.flags["WRITEABLE"] and src_f32.strides[1] == 4:
+        b_c = np.ascontiguousarray(bias, dtype=np.float32) if bias is not None else None
+        _LIB.f32_unpad_transpose_bias_relu(
+            _ptr_f32(src_f32),
+            src_f32.strides[0] // 4,
+            _ptr_f32(dst_c_hw),
+            _ptr_f32(b_c) if b_c is not None else ctypes.cast(0, _C_FLOAT_PTR),
+            m_hw,
+            c_out,
+            1 if apply_relu else 0,
+        )
+        return
+
+    sub = src_f32[:m_hw, :c_out]
+    if bias is not None:
+        sub = sub + bias[:c_out]
+    if apply_relu:
+        sub = np.maximum(sub, np.float32(0.0))
+    np.copyto(dst_c_hw.reshape(c_out, m_hw), sub.T)
+
+
+def im2col_3x3_s1_p1_kykxc_bf16_pad(
+    x_nchw: np.ndarray,
+    dst_u16: np.ndarray,
+    zero_tail: bool = True,
+) -> None:
+    """Pack (1, C_in, H, W) float32 directly into (H*W, 9*C_in) padded bf16 uint16 in (ky, kx, C_in) order."""
+    if x_nchw.ndim != 4 or x_nchw.shape[0] != 1:
+        raise ValueError(f"Expected (1, C, H, W) tensor, got {x_nchw.shape}")
+    _, c_in, h, w = x_nchw.shape
+    dst = dst_u16.view(np.uint16) if dst_u16.dtype != np.uint16 else dst_u16
+    dst_rows, dst_cols = dst.shape
+    hw = h * w
+    k_elems = 9 * c_in
+    if hw > dst_rows or k_elems > dst_cols:
+        raise ValueError(f"Destination {dst.shape} smaller than ({hw}, {k_elems})")
+
+    x_c = np.ascontiguousarray(x_nchw, dtype=np.float32)
+    if _LIB is not None and dst.flags["WRITEABLE"] and dst.strides[1] == 2 and dst.strides[0] % 2 == 0:
+        rc = _LIB.im2col_3x3_s1_p1_kykxc_bf16_pad(
+            _ptr_f32(x_c),
+            _ptr_u16(dst),
+            dst.strides[0] // 2,
+            dst_rows,
+            dst_cols,
+            c_in,
+            h,
+            w,
+            1 if zero_tail else 0,
+        )
+        if rc == 0:
+            return
+
+    x_pad = np.pad(x_c[0], ((0, 0), (1, 1), (1, 1)), mode="constant")
+    hwc_pad = np.transpose(x_pad, (1, 2, 0))
+    patches = np.empty((hw, k_elems), dtype=np.float32)
+    for ky in range(3):
+        for kx in range(3):
+            sl = hwc_pad[ky : ky + h, kx : kx + w, :].reshape(hw, c_in)
+            off = (ky * 3 + kx) * c_in
+            patches[:, off : off + c_in] = sl
+    f32_to_bf16_pad(patches, dst, hw, k_elems, zero_tail=zero_tail)
+
+
+def temporal_attn_roll(
+    q: np.ndarray,
+    k_cur: np.ndarray,
+    v_cur: np.ndarray,
+    k_buf: np.ndarray,
+    v_buf: np.ndarray,
+    k_pe: np.ndarray,
+    v_pe: np.ndarray,
+    n_heads: int,
+    scale: float,
+    has_history: bool,
+) -> np.ndarray:
+    """Fused rolling-window temporal multi-head self-attention for (d, ch) inputs."""
+    d, ch = k_cur.shape
+    t_len = k_buf.shape[1]
+    dh = ch // n_heads
+
+    if (
+        _LIB is not None
+        and q.flags["C_CONTIGUOUS"]
+        and k_cur.flags["C_CONTIGUOUS"]
+        and v_cur.flags["C_CONTIGUOUS"]
+        and k_buf.flags["C_CONTIGUOUS"]
+        and v_buf.flags["C_CONTIGUOUS"]
+        and k_pe.flags["C_CONTIGUOUS"]
+        and v_pe.flags["C_CONTIGUOUS"]
+    ):
+        out = np.empty((d, ch), dtype=np.float32)
+        _LIB.temporal_attn_roll_f32(
+            _ptr_f32(q),
+            _ptr_f32(k_cur),
+            _ptr_f32(v_cur),
+            _ptr_f32(k_buf),
+            _ptr_f32(v_buf),
+            _ptr_f32(k_pe),
+            _ptr_f32(v_pe),
+            _ptr_f32(out),
+            d,
+            t_len,
+            n_heads,
+            dh,
+            float(scale),
+            1 if has_history else 0,
+        )
+        return out
+
+    if not has_history:
+        k_buf[:, : t_len - 1, :] = k_cur[:, None, :]
+        v_buf[:, : t_len - 1, :] = v_cur[:, None, :]
+        return (v_cur + v_pe[0]).astype(np.float32, copy=False)
+
+    k_buf[:, t_len - 1, :] = k_cur
+    v_buf[:, t_len - 1, :] = v_cur
+    k = k_buf + k_pe[None, :, :]
+    v = v_buf + v_pe[None, :, :]
+    qh = q.reshape(d, n_heads, 1, dh)
+    kh = k.reshape(d, t_len, n_heads, dh).transpose(0, 2, 3, 1)
+    vh = v.reshape(d, t_len, n_heads, dh).transpose(0, 2, 1, 3)
+    attn = softmax_rows(np.matmul(qh, kh) * np.float32(scale))
+    out = np.ascontiguousarray(np.matmul(attn, vh).reshape(d, ch), dtype=np.float32)
+    if t_len >= 4:
+        k_buf[:, 2 : t_len - 2, :] = k_buf[:, 3 : t_len - 1, :]
+        k_buf[:, t_len - 2, :] = k_cur
+        v_buf[:, 2 : t_len - 2, :] = v_buf[:, 3 : t_len - 1, :]
+        v_buf[:, t_len - 2, :] = v_cur
+    return out
 
 
 def bilinear_resize_nchw(

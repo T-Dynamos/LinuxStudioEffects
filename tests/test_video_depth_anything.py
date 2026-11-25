@@ -210,6 +210,8 @@ class VideoDepthAnythingUnitTests(unittest.TestCase):
         self.assertEqual((fast.depth_config.variant, fast.depth_config.input_size, fast.blur_passes), ("small", 196, (1, 2, 4)))
         self.assertEqual((balanced.depth_config.variant, balanced.depth_config.input_size, balanced.blur_passes), ("base", 252, (2, 4, 6)))
         self.assertEqual((high.depth_config.variant, high.depth_config.input_size, high.blur_passes), ("base", 336, (3, 6, 8)))
+        self.assertTrue(balanced.async_depth)
+        self.assertAlmostEqual(balanced.depth_interval_s, 0.05)
 
         override = CpuPortraitBlurEffect(
             quality="high",
@@ -230,10 +232,19 @@ class VideoDepthAnythingUnitTests(unittest.TestCase):
         self.assertEqual(override.blur_passes, (1, 3, 5))
         self.assertEqual(override.edge_refine_radius, 3)
 
-        override.set_params(blur_strength=0.6, focus_mode="manual", focus_depth=0.5, dof_range=0.25, falloff=0.15, mask_gamma=0.9)
+        override.set_params(
+            blur_strength=0.6,
+            focus_mode="manual",
+            focus_depth=0.5,
+            dof_range=0.25,
+            falloff=0.15,
+            mask_gamma=0.9,
+            async_depth=False,
+        )
         self.assertEqual(override.blur_strength, 0.6)
         self.assertEqual(override.focus_mode, "manual")
         self.assertEqual(override.mask_gamma, 0.9)
+        self.assertFalse(override.async_depth)
 
         with self.assertRaises(ValueError):
             CpuPortraitBlurEffect(quality="ultra", use_real_weights=False)
@@ -241,6 +252,63 @@ class VideoDepthAnythingUnitTests(unittest.TestCase):
             override.set_params(blur_passes=(0, 2, 4))
         with self.assertRaises(ValueError):
             override.set_params(unknown_param=1)
+
+    def test_temporal_attn_roll_and_transpose_host_ops_match_numpy_reference(self) -> None:
+        rng = np.random.default_rng(29)
+
+        # Transpose + bf16 packing parity against sequential pad
+        src = rng.standard_normal((71, 139)).astype(np.float32)
+        dst_tr = np.empty((256, 128), dtype=np.uint16)
+        dst_ref = np.empty((256, 128), dtype=np.uint16)
+        host_ops.f32_transpose_to_bf16_pad(src, dst_tr, 71, 139, zero_tail=True)
+        host_ops.f32_to_bf16_pad(np.ascontiguousarray(src.T), dst_ref, 139, 71, zero_tail=True)
+        np.testing.assert_array_equal(dst_tr, dst_ref)
+
+        # Unpad + transpose + bias + relu parity
+        c_pad = rng.standard_normal((256, 128)).astype(np.float32)
+        bias = rng.standard_normal((101,)).astype(np.float32)
+        out_nchw = np.empty((1, 101, 13, 11), dtype=np.float32)
+        host_ops.f32_unpad_transpose_bias_relu(c_pad, out_nchw.reshape(101, 143), 143, 101, bias=bias, apply_relu=True)
+        ref_nchw = np.maximum(c_pad[:143, :101] + bias, 0.0).T.reshape(1, 101, 13, 11)
+        np.testing.assert_allclose(out_nchw, ref_nchw, atol=1e-6)
+
+        # Fused streaming rolling temporal attention parity across frames and head dims
+        n_heads, dh, d, t_len = 8, 48, 32, 32
+        ch = n_heads * dh
+        k_pe = rng.standard_normal((t_len, ch)).astype(np.float32) * 0.2
+        v_pe = rng.standard_normal((t_len, ch)).astype(np.float32) * 0.2
+        kb1 = np.zeros((d, t_len, ch), dtype=np.float32)
+        vb1 = np.zeros((d, t_len, ch), dtype=np.float32)
+        kb2 = np.zeros((d, t_len, ch), dtype=np.float32)
+        vb2 = np.zeros((d, t_len, ch), dtype=np.float32)
+        scale = float(1.0 / np.sqrt(dh))
+        for step in range(4):
+            q = rng.standard_normal((d, ch)).astype(np.float32)
+            kc = rng.standard_normal((d, ch)).astype(np.float32)
+            vc = rng.standard_normal((d, ch)).astype(np.float32)
+            has_h = step > 0
+            got = host_ops.temporal_attn_roll(q, kc, vc, kb1, vb1, k_pe, v_pe, n_heads, scale, has_h)
+            if not has_h:
+                kb2[:, : t_len - 1, :] = kc[:, None, :]
+                vb2[:, : t_len - 1, :] = vc[:, None, :]
+                ref = (vc + v_pe[0]).astype(np.float32)
+            else:
+                kb2[:, t_len - 1, :] = kc
+                vb2[:, t_len - 1, :] = vc
+                kk = kb2 + k_pe[None, :, :]
+                vv = vb2 + v_pe[None, :, :]
+                qh = q.reshape(d, n_heads, 1, dh)
+                kh = kk.reshape(d, t_len, n_heads, dh).transpose(0, 2, 3, 1)
+                vh = vv.reshape(d, t_len, n_heads, dh).transpose(0, 2, 1, 3)
+                att = host_ops.softmax_rows(np.matmul(qh, kh) * np.float32(scale))
+                ref = np.matmul(att, vh).reshape(d, ch)
+                kb2[:, 2 : t_len - 2, :] = kb2[:, 3 : t_len - 1, :]
+                kb2[:, t_len - 2, :] = kc
+                vb2[:, 2 : t_len - 2, :] = vb2[:, 3 : t_len - 1, :]
+                vb2[:, t_len - 2, :] = vc
+            np.testing.assert_allclose(got, ref, atol=1e-5)
+            np.testing.assert_allclose(kb1, kb2, atol=1e-6)
+            np.testing.assert_allclose(vb1, vb2, atol=1e-6)
 
 
 class VideoDepthAnythingNpuTests(unittest.TestCase):
@@ -299,6 +367,106 @@ class VideoDepthAnythingNpuTests(unittest.TestCase):
         out = eff.process(rgb0, FrameContext(1, 0.0, 320, 240, 30.0))
         eff.teardown()
         self.assertEqual(out.shape, (240, 320, 3))
+
+    def test_npu_portrait_blur_native_formats_composite_and_async(self) -> None:
+        if not probe_npu().available:
+            self.skipTest("No AMD NPU available on this host")
+
+        cfg = get_video_depth_config("small", input_size=140)
+        weights = create_synthetic_weights(cfg, seed=9)
+        rng = np.random.default_rng(9)
+
+        # Verify NPU AIE2 4-column bokeh composite is bit-exact with CPU composite.
+        h, w = 120, 160
+        l0 = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        l1 = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        l2 = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        l3 = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        coc = rng.integers(0, 256, size=(h, w), dtype=np.uint8)
+
+        eff_comp = NpuPortraitBlurEffect(variant="small", input_size=140, weights=weights, use_npu_composite=True)
+        eff_comp.setup(w, h, 30.0)
+        try:
+            np.testing.assert_array_equal(
+                eff_comp._composite_bokeh(l0, l1, l2, l3, coc),
+                host_ops.bokeh_composite_u8(l0, l1, l2, l3, coc),
+            )
+        finally:
+            eff_comp.teardown()
+
+        # Verify all native formats + async_depth + context-cache survival across formats.
+        for fmt, shape in (
+            ("RGB3", (120, 160, 3)),
+            ("BGR3", (120, 160, 3)),
+            ("YUYV", (120, 80, 4)),
+            ("UYVY", (120, 80, 4)),
+        ):
+            frame = rng.integers(0, 256, size=shape, dtype=np.uint8)
+            eff = NpuPortraitBlurEffect(
+                variant="small",
+                input_size=140,
+                weights=weights,
+                async_depth=(fmt == "YUYV"),
+                depth_interval_s=0.0,
+            )
+            eff.setup(160, 120, 30.0)
+            try:
+                out0 = eff.process(frame, FrameContext(1, 0.0, 160, 120, 30.0, pixel_format=fmt))
+                out1 = eff.process(frame, FrameContext(2, 0.033, 160, 120, 30.0, pixel_format=fmt))
+                self.assertEqual(out0.shape, shape, msg=fmt)
+                self.assertEqual(out1.shape, shape, msg=fmt)
+                self.assertEqual(out1.dtype, np.uint8, msg=fmt)
+            finally:
+                eff.teardown()
+
+    def test_npu_portrait_blur_base_backbone_parity(self) -> None:
+        if not probe_npu().available:
+            self.skipTest("No AMD NPU available on this host")
+
+        cfg = get_video_depth_config("base", input_size=252)
+        weights = create_synthetic_weights(cfg, seed=13)
+        rng = np.random.default_rng(13)
+        rgb = rng.integers(0, 256, size=(240, 320, 3), dtype=np.uint8)
+
+        cpu_eff = CpuPortraitBlurEffect(variant="base", input_size=252, weights=weights)
+        npu_eff = NpuPortraitBlurEffect(variant="base", input_size=252, weights=weights)
+        try:
+            cpu_out = cpu_eff.process(rgb, FrameContext(1, 0.0, 320, 240, 30.0))
+            npu_out = npu_eff.process(rgb, FrameContext(1, 0.0, 320, 240, 30.0))
+        finally:
+            cpu_eff.teardown()
+            npu_eff.teardown()
+
+        assert cpu_eff.last_result is not None and npu_eff.last_result is not None
+        corr = float(np.corrcoef(cpu_eff.last_result.depth.ravel(), npu_eff.last_result.depth.ravel())[0, 1])
+        self.assertGreater(corr, 0.99)
+        self.assertEqual(cpu_out.shape, npu_out.shape)
+        self.assertIsNotNone(npu_eff.last_result.npu_stats)
+        assert npu_eff.last_result.npu_stats is not None
+        # 48 backbone linear projections + high-FLOP DPT 3x3 convolutions offloaded to NPU.
+        self.assertGreater(npu_eff.last_result.npu_stats.dispatches, 48)
+
+    def test_npu_conv2d_3x3_s1_p1_parity(self) -> None:
+        if not probe_npu().available:
+            self.skipTest("No AMD NPU available on this host")
+
+        rng = np.random.default_rng(31)
+        x = rng.standard_normal((1, 128, 72, 72)).astype(np.float32)
+        w4 = (rng.standard_normal((128, 128, 3, 3)) * 0.05).astype(np.float32)
+        bias = (rng.standard_normal((128,)) * 0.1).astype(np.float32)
+        w_ck_cout = np.ascontiguousarray(w4.reshape(128, -1).T)
+        w_kykxc_cout = np.ascontiguousarray(w4.transpose(2, 3, 1, 0).reshape(9 * 128, 128))
+
+        ref = np.maximum(host_ops.conv2d_3x3_s1_p1(x, w4, bias), 0.0)
+        mm_exec = NpuMatMulExecutor()
+        try:
+            got = mm_exec.conv2d_3x3_s1_p1_nchw(x, w_kykxc_cout, w_ck_cout, bias=bias, apply_relu=True)
+        finally:
+            mm_exec.close()
+
+        self.assertEqual(got.shape, ref.shape)
+        corr = float(np.corrcoef(got.ravel(), ref.ravel())[0, 1])
+        self.assertGreater(corr, 0.9999)
 
 
 if __name__ == "__main__":

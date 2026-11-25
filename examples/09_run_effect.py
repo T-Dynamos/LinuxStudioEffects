@@ -171,7 +171,7 @@ def main() -> int:
     parser.add_argument("--async-depth", action="store_true", help="Run depth inference asynchronously (default for live portrait_blur)")
     parser.add_argument("--sync-depth", action="store_true", help="Run depth inference synchronously on every frame")
     parser.add_argument("--blur-strength", type=float, default=1.0, help="Portrait blur strength in [0, 1] (default: 1.0)")
-    parser.add_argument("--dof-range", type=float, default=0.30, help="Sharp foreground depth range (default: 0.30)")
+    parser.add_argument("--dof-range", type=float, default=0.25, help="Sharp foreground depth range (default: 0.25)")
     parser.add_argument("--falloff", type=float, default=0.20, help="Blur transition depth falloff (default: 0.20)")
     parser.add_argument("--focus-mode", choices=("auto", "manual"), default="auto", help="Focus selection mode")
     parser.add_argument("--focus-depth", type=float, default=0.7, help="Manual focus depth in [0, 1]")

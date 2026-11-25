@@ -208,10 +208,10 @@ class PortraitBlurEffect(FrameEffect):
         blur_passes: tuple[int, int, int] | None = None,
         focus_mode: str = "auto",
         focus_depth: float = 0.7,
-        focus_percentile: float = 65.0,
-        focus_region: tuple[float, float, float, float] = (0.10, 0.75, 0.25, 0.75),
+        focus_percentile: float = 82.0,
+        focus_region: tuple[float, float, float, float] = (0.15, 0.70, 0.33, 0.67),
         depth_percentiles: tuple[float, float] = (5.0, 95.0),
-        dof_range: float = 0.30,
+        dof_range: float = 0.25,
         falloff: float = 0.20,
         blur_foreground: bool = False,
         temporal_alpha: float = 0.35,
@@ -220,8 +220,8 @@ class PortraitBlurEffect(FrameEffect):
         edge_refine_eps: float | None = None,
         mask_gamma: float = 1.0,
         halo_suppression: float = 10.0,
-        async_depth: bool = False,
-        depth_interval_s: float = 0.2,
+        async_depth: bool = True,
+        depth_interval_s: float = 0.05,
         name: str | None = None,
         device: ComputeDevice | str = ComputeDevice.CPU,
         enabled: bool = True,
@@ -243,6 +243,14 @@ class PortraitBlurEffect(FrameEffect):
         self.local_files_only = local_files_only
         self._explicit_weights = weights
 
+        self._depth_lock = threading.Lock()
+        self._latest_frame: tuple[np.ndarray, str] | None = None
+        self._latest_depth: np.ndarray | None = None
+        self._depth_updates: int = 0
+        self._stop_event = threading.Event()
+        self._frame_ready_event = threading.Event()
+        self._depth_thread: threading.Thread | None = None
+
         self.set_params(
             blur_strength=blur_strength,
             blur_passes=resolved_passes,  # type: ignore[arg-type]
@@ -260,19 +268,13 @@ class PortraitBlurEffect(FrameEffect):
             edge_refine_eps=resolved_eps,
             mask_gamma=mask_gamma,
             halo_suppression=halo_suppression,
+            async_depth=async_depth,
             depth_interval_s=depth_interval_s,
         )
-        self.async_depth = bool(async_depth)
 
         self._model: VideoDepthAnythingModel | None = None
         self.last_result: InferenceResult | None = None
         self.last_coc: np.ndarray | None = None
-
-        # Background depth state for decoupled ~30fps live bokeh streaming
-        self._depth_lock = threading.Lock()
-        self._latest_frame: np.ndarray | None = None
-        self._latest_depth: np.ndarray | None = None
-        self._depth_updates: int = 0
         self._stop_event = threading.Event()
         self._frame_ready_event = threading.Event()
         self._depth_thread: threading.Thread | None = None
@@ -368,6 +370,11 @@ class PortraitBlurEffect(FrameEffect):
             if val <= 0.0:
                 raise ValueError(f"halo_suppression must be > 0, got {val}")
             self.halo_suppression = val
+        if "async_depth" in params:
+            new_async = bool(params["async_depth"])
+            if getattr(self, "async_depth", False) and not new_async:
+                self._stop_depth_worker()
+            self.async_depth = new_async
         if "depth_interval_s" in params:
             val = float(params["depth_interval_s"])  # type: ignore[arg-type]
             if val < 0.0:
@@ -390,6 +397,7 @@ class PortraitBlurEffect(FrameEffect):
             "edge_refine_eps",
             "mask_gamma",
             "halo_suppression",
+            "async_depth",
             "depth_interval_s",
         }
         if unknown:
@@ -595,8 +603,10 @@ class PortraitBlurEffect(FrameEffect):
                     snap = self._latest_frame
                 if snap is None or self._model is None:
                     continue
+                raw_frame, raw_fmt = snap
                 t0 = time.perf_counter()
-                res = self._model.infer(snap)
+                model_input = model_luma_input(raw_frame, raw_fmt)
+                res = self._model.infer(model_input)
                 with self._depth_lock:
                     self._latest_depth = res.depth
                     self.last_result = res
@@ -683,19 +693,20 @@ class PortraitBlurEffect(FrameEffect):
             self.setup(w, h, ctx.fps if ctx else 30.0)
         assert self._model is not None
 
-        model_input = model_luma_input(frame, pixel_format)
         if not self.async_depth:
+            model_input = model_luma_input(frame, pixel_format)
             res = self._model.infer(model_input)
             self.last_result = res
             self._depth_updates += 1
             return self.apply_depth_bokeh(frame, res.depth, pixel_format=pixel_format)
 
-        latest_copy = frame.copy() if pixel_format == "RGB3" else model_input
+        frame_copy = frame.copy()
         with self._depth_lock:
             depth = self._latest_depth
-            self._latest_frame = latest_copy
+            self._latest_frame = (frame_copy, pixel_format)
         if depth is None:
-            res = self._model.infer(latest_copy)
+            model_input = model_luma_input(frame_copy, pixel_format)
+            res = self._model.infer(model_input)
             with self._depth_lock:
                 self._latest_depth = res.depth
                 self.last_result = res

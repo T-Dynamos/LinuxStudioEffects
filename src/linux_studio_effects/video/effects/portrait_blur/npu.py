@@ -210,7 +210,7 @@ class PortraitBlurEffect(_CpuPortraitBlurEffect):
     def __init__(
         self,
         *,
-        use_npu_composite: bool = True,
+        use_npu_composite: bool = False,
         device: ComputeDevice | str = ComputeDevice.NPU,
         **kwargs: object,
     ) -> None:
@@ -218,6 +218,7 @@ class PortraitBlurEffect(_CpuPortraitBlurEffect):
         self._npu_runtime: Any = None
         self._npu_handle: Any = None
         self._npu_kernel: Any = None
+        self._npu_kernel_obj: Any = None
         self._npu_in_a: Any = None
         self._npu_in_b: Any = None
         self._npu_out: Any = None
@@ -227,6 +228,7 @@ class PortraitBlurEffect(_CpuPortraitBlurEffect):
         self._npu_handle = None
         self._npu_runtime = None
         self._npu_kernel = None
+        self._npu_kernel_obj = None
         self._npu_in_a = None
         self._npu_in_b = None
         self._npu_out = None
@@ -262,6 +264,7 @@ class PortraitBlurEffect(_CpuPortraitBlurEffect):
 
         self._npu_runtime = DefaultNPURuntime
         self._npu_kernel = kernel
+        self._npu_kernel_obj = npu_kernel
         self._npu_handle = handle
         self._npu_in_a = in_a
         self._npu_in_b = in_b
@@ -275,10 +278,13 @@ class PortraitBlurEffect(_CpuPortraitBlurEffect):
         l3: np.ndarray,
         coc_u8: np.ndarray,
     ) -> np.ndarray:
-        if self._npu_handle is None or self._npu_in_a is None:
+        if self._npu_kernel_obj is None or self._npu_in_a is None:
             return super()._composite_bokeh(l0, l1, l2, l3, coc_u8)
+        from aie.utils.hostruntime.hostruntime import HostRuntimeError
+
         h, w, _ = l0.shape
         num_pixels = h * w
+        args = [self._npu_in_a, self._npu_in_b, self._npu_out]
         with NPU_DISPATCH_LOCK:
             with self._npu_in_a.overwrite() as dst_a:
                 va = dst_a.reshape(num_pixels, 4)
@@ -289,7 +295,13 @@ class PortraitBlurEffect(_CpuPortraitBlurEffect):
                 vb[:, 0:3] = l1.reshape(num_pixels, 3)
                 vb[:, 3:6] = l2.reshape(num_pixels, 3)
                 vb[:, 6:9] = l3.reshape(num_pixels, 3)
-            self._npu_runtime.run(self._npu_handle, [self._npu_in_a, self._npu_in_b, self._npu_out])
+            if self._npu_handle is None or not getattr(self._npu_handle, "_is_valid", False):
+                self._npu_handle = self._npu_runtime.load(self._npu_kernel_obj)
+            try:
+                self._npu_runtime.run(self._npu_handle, args, only_if_loaded=True)
+            except HostRuntimeError:
+                self._npu_handle = self._npu_runtime.load(self._npu_kernel_obj)
+                self._npu_runtime.run(self._npu_handle, args, only_if_loaded=True)
             return self._npu_out.numpy().reshape(h, w, 3).copy()
 
     def teardown(self) -> None:

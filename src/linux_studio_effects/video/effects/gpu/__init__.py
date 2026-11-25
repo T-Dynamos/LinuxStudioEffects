@@ -1,3 +1,5 @@
-"""GPU-accelerated video frame effects (placeholder; implementations pending)."""
+"""GPU-accelerated video frame effects (one effect per module)."""
 
-__all__: list[str] = []
+from .depth_anything import GpuDepthAnythingEffect
+
+__all__ = ["GpuDepthAnythingEffect"]

@@ -41,3 +41,8 @@ Run any example from the repository root using `iron-env/bin/python` (or any Pyt
    ```bash
    ./iron-env/bin/python examples/06_npu_greyscale_camera.py
    ```
+
+7. **[07_depth_anything_v2_benchmark.py](07_depth_anything_v2_benchmark.py)** — Depth Anything V2 (`Small` / `Base` / `Large`) hardware feasibility matrix, NPU vs CPU vs GPU benchmark, and optional `--live` colorized depth camera stream.
+   ```bash
+   ./iron-env/bin/python examples/07_depth_anything_v2_benchmark.py --variants small --input-size 252 --real-weights
+   ```

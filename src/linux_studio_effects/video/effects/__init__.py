@@ -16,13 +16,15 @@ from .base import (
     resolve_compute_device,
 )
 from .cpu import (
+    CpuDepthAnythingEffect,
     FastBlurEffect,
     MirrorEffect,
     PassthroughEffect,
     SpotlightEffect,
     ZoomCropEffect,
 )
-from .npu import GreyscaleEffect
+from .gpu import GpuDepthAnythingEffect
+from .npu import GreyscaleEffect, NpuDepthAnythingEffect
 
 BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "none": PassthroughEffect,
@@ -31,19 +33,24 @@ BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "spotlight": SpotlightEffect,
     "blur": FastBlurEffect,
     "greyscale": GreyscaleEffect,
+    "depth_cpu": CpuDepthAnythingEffect,
+    "depth_npu": NpuDepthAnythingEffect,
 }
 
 __all__ = [
     "BUILTIN_EFFECTS",
     "CallableEffect",
     "ComputeDevice",
+    "CpuDepthAnythingEffect",
     "DeviceUnavailableError",
     "EffectChain",
     "FastBlurEffect",
     "FrameContext",
     "FrameEffect",
+    "GpuDepthAnythingEffect",
     "GreyscaleEffect",
     "MirrorEffect",
+    "NpuDepthAnythingEffect",
     "PassthroughEffect",
     "SpotlightEffect",
     "ZoomCropEffect",

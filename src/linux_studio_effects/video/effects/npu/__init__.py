@@ -1,3 +1,5 @@
-"""NPU-accelerated video frame effects (placeholder; implementations pending)."""
+"""NPU-accelerated video frame effects (one effect per module)."""
 
-__all__: list[str] = []
+from .greyscale import GreyscaleEffect
+
+__all__ = ["GreyscaleEffect"]

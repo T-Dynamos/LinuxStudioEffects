@@ -107,7 +107,10 @@ class EffectsUnitTests(unittest.TestCase):
     def test_builtin_cpu_effects_preserve_shape_and_dtype(self) -> None:
         frame = np.random.default_rng(42).integers(0, 256, size=(120, 160, 3), dtype=np.uint8)
         for name, factory in BUILTIN_EFFECTS.items():
-            eff = factory()
+            try:
+                eff = factory()
+            except DeviceUnavailableError:
+                continue
             eff.setup(160, 120, 30.0)
             out = eff.process(frame, FrameContext(1, 0.0, 160, 120, 30.0))
             self.assertEqual(out.shape, frame.shape, msg=name)
@@ -128,13 +131,15 @@ class EffectsUnitTests(unittest.TestCase):
         from linux_studio_effects.video.effects.cpu.passthrough import PassthroughEffect as CpuPass
         from linux_studio_effects.video.effects.cpu.spotlight import SpotlightEffect as CpuSpot
         from linux_studio_effects.video.effects.cpu.zoom_crop import ZoomCropEffect as CpuZoom
+        from linux_studio_effects.video.effects.npu.greyscale import GreyscaleEffect as NpuGrey
 
         self.assertIs(CpuBlur, FastBlurEffect)
         self.assertIs(CpuMirror, MirrorEffect)
         self.assertIs(CpuPass, PassthroughEffect)
         self.assertIs(CpuSpot, SpotlightEffect)
         self.assertIs(CpuZoom, ZoomCropEffect)
-        self.assertEqual(npu.__all__, [])
+        self.assertEqual(npu.__all__, ["GreyscaleEffect"])
+        self.assertEqual(NpuGrey.supported_devices, (ComputeDevice.NPU,))
         self.assertEqual(gpu.__all__, [])
 
 

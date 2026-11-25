@@ -22,6 +22,7 @@ from .cpu import (
     SpotlightEffect,
     ZoomCropEffect,
 )
+from .npu import GreyscaleEffect
 
 BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "none": PassthroughEffect,
@@ -29,6 +30,7 @@ BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "zoom": ZoomCropEffect,
     "spotlight": SpotlightEffect,
     "blur": FastBlurEffect,
+    "greyscale": GreyscaleEffect,
 }
 
 __all__ = [
@@ -40,6 +42,7 @@ __all__ = [
     "FastBlurEffect",
     "FrameContext",
     "FrameEffect",
+    "GreyscaleEffect",
     "MirrorEffect",
     "PassthroughEffect",
     "SpotlightEffect",

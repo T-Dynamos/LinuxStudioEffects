@@ -36,3 +36,8 @@ Run any example from the repository root using `iron-env/bin/python` (or any Pyt
    ```bash
    ./iron-env/bin/python examples/05_frame_effect_pipeline.py --effect studio_demo
    ```
+
+6. **[06_npu_greyscale_camera.py](06_npu_greyscale_camera.py)** — Live webcam -> AMD Ryzen AI NPU (`GreyscaleEffect` via MLIR-AIE / IRON) -> `v4l2loopback` virtual webcam.
+   ```bash
+   ./iron-env/bin/python examples/06_npu_greyscale_camera.py
+   ```

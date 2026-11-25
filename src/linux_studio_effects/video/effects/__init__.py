@@ -25,6 +25,7 @@ from .base import (
 )
 
 _LAZY_EFFECTS = {
+    "AestheticLightEffect": ("aesthetic_light.cpu", "AestheticLightEffect"),
     "AutomaticFramingEffect": ("automatic_framing.cpu", "AutomaticFramingEffect"),
     "BackgroundSegmentationEffect": ("background_segmentation.cpu", "BackgroundSegmentationEffect"),
     "FastBlurEffect": ("fast_blur.cpu", "FastBlurEffect"),
@@ -32,6 +33,7 @@ _LAZY_EFFECTS = {
     "MirrorEffect": ("mirror.cpu", "MirrorEffect"),
     "PassthroughEffect": ("passthrough.cpu", "PassthroughEffect"),
     "PortraitBlurEffect": ("portrait_blur.cpu", "PortraitBlurEffect"),
+    "PortraitLightEffect": ("portrait_light.cpu", "PortraitLightEffect"),
     "SpotlightEffect": ("spotlight.cpu", "SpotlightEffect"),
     "ZoomCropEffect": ("zoom_crop.cpu", "ZoomCropEffect"),
 }
@@ -52,6 +54,12 @@ BUILTIN_EFFECTS: dict[str, Callable[[], FrameEffect]] = {
     "portrait_blur": _factory("portrait_blur"),
     "portrait_blur_cpu": _factory("portrait_blur", "cpu"),
     "portrait_blur_npu": _factory("portrait_blur", "npu"),
+    "portrait_light": _factory("portrait_light"),
+    "portrait_light_cpu": _factory("portrait_light", "cpu"),
+    "portrait_light_npu": _factory("portrait_light", "npu"),
+    "aesthetic_light": _factory("aesthetic_light"),
+    "aesthetic_light_cpu": _factory("aesthetic_light", "cpu"),
+    "aesthetic_light_npu": _factory("aesthetic_light", "npu"),
     "background_segmentation": _factory("background_segmentation"),
     "background_segmentation_cpu": _factory("background_segmentation", "cpu"),
     "background_segmentation_npu": _factory("background_segmentation", "npu"),
@@ -78,6 +86,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "BUILTIN_EFFECTS",
+    "AestheticLightEffect",
     "AutomaticFramingEffect",
     "BackgroundSegmentationEffect",
     "create_effect",
@@ -86,6 +95,7 @@ __all__ = [
     "CallableEffect",
     "ComputeDevice",
     "PortraitBlurEffect",
+    "PortraitLightEffect",
     "DeviceUnavailableError",
     "EffectChain",
     "FrameGraph",

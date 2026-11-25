@@ -137,7 +137,7 @@ class EffectsUnitTests(unittest.TestCase):
 
         frame = np.random.default_rng(42).integers(0, 256, size=(120, 160, 3), dtype=np.uint8)
         for name, factory in BUILTIN_EFFECTS.items():
-            if name.startswith(("portrait_blur", "background_segmentation", "automatic_framing")):
+            if name.startswith(("portrait_blur", "background_segmentation", "automatic_framing", "portrait_light", "aesthetic_light")):
                 continue
             try:
                 eff = factory()
@@ -166,6 +166,7 @@ class EffectsUnitTests(unittest.TestCase):
         bs.teardown()
 
         from linux_studio_effects.video.effects.automatic_framing.cpu import AutomaticFramingEffect
+        from linux_studio_effects.video.effects.portrait_light.cpu import PortraitLightEffect
 
         af = AutomaticFramingEffect(max_size=128, use_real_weights=False)
         af.setup(160, 120, 30.0)
@@ -173,6 +174,13 @@ class EffectsUnitTests(unittest.TestCase):
         self.assertEqual(af_out.shape, frame.shape)
         self.assertEqual(af_out.dtype, np.uint8)
         af.teardown()
+
+        pl = PortraitLightEffect(variant="small", input_size=140, use_real_weights=False, async_depth=False)
+        pl.setup(160, 120, 30.0)
+        pl_out = pl.process(frame, FrameContext(1, 0.0, 160, 120, 30.0, pixel_format="RGB3"))
+        self.assertEqual(pl_out.shape, frame.shape)
+        self.assertEqual(pl_out.dtype, np.uint8)
+        pl.teardown()
 
         self.assertIs(PassthroughEffect().process(frame), frame)
         mirrored = MirrorEffect().process(frame)
@@ -239,6 +247,8 @@ class EffectsUnitTests(unittest.TestCase):
         self.assertEqual(catalog["portrait_blur"], ("cpu", "npu"))
         self.assertEqual(catalog["background_segmentation"], ("cpu", "npu"))
         self.assertEqual(catalog["automatic_framing"], ("cpu", "npu"))
+        self.assertEqual(catalog["portrait_light"], ("cpu", "npu"))
+        self.assertEqual(catalog["aesthetic_light"], ("cpu", "npu"))
         self.assertEqual(catalog["greyscale"], ("npu",))
         self.assertEqual(catalog["mirror"], ("cpu", "npu"))
 

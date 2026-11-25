@@ -183,6 +183,25 @@ def main() -> int:
         help="Background segmentation composite mode",
     )
     parser.add_argument("--bg-image", help="Background replacement image path for background_segmentation --bg-mode image")
+    parser.add_argument(
+        "--light-pos",
+        type=lambda s: tuple(float(p) for p in s.split(",")),
+        default=None,
+        help="3D light source position 'x,y,z' for portrait_light / aesthetic_light",
+    )
+    parser.add_argument("--light-intensity", type=float, default=None, help="Key-light intensity for portrait_light / aesthetic_light")
+    parser.add_argument(
+        "--light-source",
+        choices=("left", "right", "top_left", "top_right", "bottom_left", "bottom_right"),
+        default="left",
+        help="Directional key-light side preset for aesthetic_light (default: left)",
+    )
+    parser.add_argument(
+        "--light-color-preset",
+        choices=("warm_white", "golden", "candle", "soft_white", "cool_fill"),
+        default="warm_white",
+        help="Color tone preset for aesthetic_light (default: warm_white)",
+    )
     parser.add_argument("--input-device", default="", help="Camera device; default auto-detect")
     parser.add_argument(
         "--pixel-format",
@@ -206,22 +225,45 @@ def main() -> int:
         parser.error("Input and output resolutions must match; set --in-size and --out-size to the same WxH")
 
     model_options: dict[str, object] = {}
-    if args.effect == "portrait_blur":
+    if args.effect in ("portrait_blur", "portrait_light", "aesthetic_light"):
         if args.input_size is not None and (args.input_size <= 0 or args.input_size % 14):
-            parser.error("--input-size must be a positive multiple of 14 for portrait_blur")
+            parser.error(f"--input-size must be a positive multiple of 14 for {args.effect}")
         use_real = False if args.synthetic_weights else (args.real_weights or not args.frames)
         use_async = False if args.sync_depth else (args.async_depth or not args.frames)
-        model_options = {
-            "quality": args.quality,
-            "use_real_weights": use_real,
-            "async_depth": use_async,
-            "blur_strength": args.blur_strength,
-            "dof_range": args.dof_range,
-            "falloff": args.falloff,
-            "focus_mode": args.focus_mode,
-            "focus_depth": args.focus_depth,
-            "mask_gamma": args.mask_gamma,
-        }
+        if args.effect == "portrait_blur":
+            model_options = {
+                "quality": args.quality,
+                "use_real_weights": use_real,
+                "async_depth": use_async,
+                "blur_strength": args.blur_strength,
+                "dof_range": args.dof_range,
+                "falloff": args.falloff,
+                "focus_mode": args.focus_mode,
+                "focus_depth": args.focus_depth,
+                "mask_gamma": args.mask_gamma,
+            }
+        elif args.effect == "portrait_light":
+            model_options = {
+                "quality": args.quality,
+                "use_real_weights": use_real,
+                "async_depth": use_async,
+            }
+            if args.light_pos is not None:
+                model_options["light_pos"] = args.light_pos
+            if args.light_intensity is not None:
+                model_options["intensity"] = args.light_intensity
+        else:
+            model_options = {
+                "quality": args.quality,
+                "use_real_weights": use_real,
+                "async_depth": use_async,
+                "source": args.light_source,
+                "color_preset": args.light_color_preset,
+            }
+            if args.light_pos is not None:
+                model_options["light_pos"] = args.light_pos
+            if args.light_intensity is not None:
+                model_options["intensity"] = args.light_intensity
         if args.variant is not None:
             model_options["variant"] = args.variant
         if args.input_size is not None:

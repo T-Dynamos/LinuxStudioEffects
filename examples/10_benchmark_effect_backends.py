@@ -22,7 +22,7 @@ from linux_studio_effects.video import (
 )
 from linux_studio_effects.video.pixels import NATIVE_PIXEL_FORMATS
 
-_MODEL_EFFECTS = frozenset(("portrait_blur", "background_segmentation", "automatic_framing"))
+_MODEL_EFFECTS = frozenset(("portrait_blur", "portrait_light", "aesthetic_light", "background_segmentation", "automatic_framing"))
 
 
 def _size(value: str) -> tuple[int, int]:
@@ -72,7 +72,7 @@ def _benchmark_one(
     try:
         process_format = pixel_format or ("YUYV" if mode.pixel_format == "MJPG" else mode.pixel_format)
         options: dict[str, object] = {}
-        if effect_name == "portrait_blur":
+        if effect_name in ("portrait_blur", "portrait_light", "aesthetic_light"):
             options.update(
                 variant=variant,
                 input_size=input_size,

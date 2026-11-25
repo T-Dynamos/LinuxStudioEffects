@@ -29,6 +29,7 @@ implemented backend available on the host (NPU, then GPU, then CPU). Shared
 model code remains under `video/models/`.
 
 - `portrait_blur`: depth-aware bokeh blur backed by Video Depth Anything (`cpu`, `npu`)
+- `portrait_light`: depth-guided 3D virtual key-light & low-light face exposure balancing (`cpu`, `npu`)
 - `background_segmentation`: MODNet portrait matting for background blur, custom image replacement, solid color, or matte output (`cpu`, `npu`)
 - `automatic_framing`: MODNet-tracked upper-body/face pan, crop, and smooth zoom (`cpu`, `npu`)
 
@@ -116,7 +117,7 @@ python3 tests/test_npu_smoke.py
 - [x] **Automatic Framing (`automatic_framing`):** Real-time person/head localization with smooth pan, crop, and zoom tracking (`cpu`, `npu`)
 - [ ] **Eye Contact (Standard):** Subtle gaze redirection toward the camera
 - [ ] **Eye Contact (Teleprompter):** Continuous gaze correction while reading across the screen
-- [ ] **Portrait Light:** Low-light face illumination and exposure balancing
+- [x] **Portrait Light (`portrait_light`):** Depth-guided 3D virtual key-light simulation for low-light face illumination and exposure balancing (`cpu`, `npu`)
 - [ ] **Creative Filters:** Stylized real-time filters (*Illustrated*, *Animated*, *Watercolor*)
 
 ### Audio Effects

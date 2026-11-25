@@ -121,6 +121,22 @@ class EffectsUnitTests(unittest.TestCase):
         self.assertEqual(SpotlightEffect(0.5).process(frame).shape, frame.shape)
         self.assertEqual(FastBlurEffect(scale=4, passes=2).process(frame).shape, frame.shape)
 
+    def test_effects_organized_by_device_and_single_file(self) -> None:
+        from linux_studio_effects.video.effects import gpu, npu
+        from linux_studio_effects.video.effects.cpu.fast_blur import FastBlurEffect as CpuBlur
+        from linux_studio_effects.video.effects.cpu.mirror import MirrorEffect as CpuMirror
+        from linux_studio_effects.video.effects.cpu.passthrough import PassthroughEffect as CpuPass
+        from linux_studio_effects.video.effects.cpu.spotlight import SpotlightEffect as CpuSpot
+        from linux_studio_effects.video.effects.cpu.zoom_crop import ZoomCropEffect as CpuZoom
+
+        self.assertIs(CpuBlur, FastBlurEffect)
+        self.assertIs(CpuMirror, MirrorEffect)
+        self.assertIs(CpuPass, PassthroughEffect)
+        self.assertIs(CpuSpot, SpotlightEffect)
+        self.assertIs(CpuZoom, ZoomCropEffect)
+        self.assertEqual(npu.__all__, [])
+        self.assertEqual(gpu.__all__, [])
+
 
 class EffectsPipelineLiveTests(unittest.TestCase):
     """Live test of FrameEffect + EffectChain inside VideoPipeline -> v4l2loopback."""

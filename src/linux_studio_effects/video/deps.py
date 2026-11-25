@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
-from .decoder import has_turbojpeg
+from .decoder import has_pyav
 from .v4l2 import VideoDeviceInfo, list_video_devices, pick_default_camera
 
 
@@ -114,14 +114,14 @@ def check_camera_deps() -> CameraDepsReport:
             )
         )
 
-    tj_ok = has_turbojpeg()
+    av_ok = has_pyav()
     items.append(
         CheckItem(
-            name="libturbojpeg",
-            ok=tj_ok,
+            name="pyav",
+            ok=av_ok,
             required=False,
-            detail="libturbojpeg.so.0 loaded (fast SIMD MJPG decode)" if tj_ok else "libturbojpeg.so.0 missing",
-            remedy="" if tj_ok else "Install libjpeg-turbo for fast MJPG frame decoding.",
+            detail="PyAV/FFmpeg available for MJPG decoding and pixel format conversion" if av_ok else "PyAV is not installed",
+            remedy="" if av_ok else "Install the project dependencies (av).",
         )
     )
 

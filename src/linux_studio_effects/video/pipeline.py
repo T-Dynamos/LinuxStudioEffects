@@ -129,14 +129,13 @@ class VideoPipeline:
 
         input_format = cfg.input_format.upper()
         output_format = cfg.output_format.upper()
-        if input_format not in NATIVE_PIXEL_FORMATS:
+        if input_format not in (*NATIVE_PIXEL_FORMATS, "MJPG"):
             raise ValueError(
-                f"Unsupported native input format {input_format}; choose one of {NATIVE_PIXEL_FORMATS}. "
-                "Compressed MJPG is not decoded in the live effects pipeline."
+                f"Unsupported input format {input_format}; choose one of {(*NATIVE_PIXEL_FORMATS, 'MJPG')}"
             )
         if output_format not in NATIVE_PIXEL_FORMATS:
             raise ValueError(f"Unsupported native output format {output_format}; choose one of {NATIVE_PIXEL_FORMATS}")
-        if input_format != output_format:
+        if input_format != "MJPG" and input_format != output_format:
             raise ValueError(
                 f"Input {input_format} and output {output_format} differ; "
                 "pixel/color-space conversion is disabled. Use the same format at both ends."
@@ -159,13 +158,13 @@ class VideoPipeline:
                 fps=cfg.output_fps,
                 colorspace=cam.negotiated.colorspace,
                 ycbcr_enc=cam.negotiated.ycbcr_enc,
-                quantization=cam.negotiated.quantization,
+                quantization=1 if input_format == "MJPG" else cam.negotiated.quantization,
                 xfer_func=cam.negotiated.xfer_func,
             )
             vcam = stack.enter_context(VirtualCameraOutput(out_cfg))
-            in_colorimetry = _colorimetry_signature(cam.negotiated, input_format)
+            in_colorimetry = _colorimetry_signature(cam.negotiated, input_format) if input_format != "MJPG" else None
             out_colorimetry = _colorimetry_signature(vcam.negotiated, output_format)
-            if in_colorimetry != out_colorimetry:
+            if in_colorimetry is not None and in_colorimetry != out_colorimetry:
                 raise RuntimeError(
                     f"Input/output colorspace, YCbCr encoding, or quantization differs "
                     f"({in_colorimetry} != {out_colorimetry}); "
@@ -202,7 +201,7 @@ class VideoPipeline:
 
                     # Determine whether this captured frame should be emitted to output.
                     should_emit = target_out_period <= 0.0 or now >= next_out_deadline - 0.002
-                    frame = cam.read_frame(decode=should_emit, native=True)
+                    frame = cam.read_frame(decode=should_emit, native=True, output_format=output_format)
                     frames_in += 1
                     dropped_in += frame.dropped_since_last
                     frame_now = frame.capture_monotonic_s
@@ -216,21 +215,21 @@ class VideoPipeline:
                                 width=frame.width,
                                 height=frame.height,
                                 fps=cam.negotiated.fps,
-                                pixel_format=cam.negotiated.pixel_format,
+                                pixel_format=output_format,
                             )
                             out_frame = self._effect.process(frame.data, ctx)
                         else:
                             out_frame = frame.data
                         if out_frame.shape[0] != vcam.negotiated.height or (
                             out_frame.shape[1] * 2
-                            if is_yuv422(cam.negotiated.pixel_format)
+                            if is_yuv422(output_format)
                             else out_frame.shape[1]
                         ) != vcam.negotiated.width:
                             out_frame = resize_native(
                                 out_frame,
                                 vcam.negotiated.width,
                                 vcam.negotiated.height,
-                                cam.negotiated.pixel_format,
+                                output_format,
                                 mode=cfg.resize_mode,
                             )
                         vcam.write_frame(out_frame)

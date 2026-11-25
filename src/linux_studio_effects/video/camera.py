@@ -127,6 +127,11 @@ class V4L2Camera:
                     f"{dev_path} negotiated {actual_format} instead of requested "
                     f"{self._requested.pixel_format.upper()}; format conversion is disabled"
                 )
+            if (fmt.fmt.pix.width, fmt.fmt.pix.height) != (self._requested.width, self._requested.height):
+                raise RuntimeError(
+                    f"{dev_path} negotiated {fmt.fmt.pix.width}x{fmt.fmt.pix.height} instead of requested "
+                    f"{self._requested.width}x{self._requested.height}; resolution changes are disabled"
+                )
 
             actual_fps = self._configure_fps(fd, self._requested.fps)
 
@@ -209,6 +214,7 @@ class V4L2Camera:
         *,
         decode: bool = True,
         native: bool = False,
+        output_format: str | None = None,
         timeout_s: float = 2.0,
     ) -> CapturedFrame:
         """Wait for and return the next frame from the V4L2 MMAP queue."""
@@ -244,7 +250,7 @@ class V4L2Camera:
                 t0 = time.perf_counter()
                 with memoryview(mm)[:raw_size] as view:
                     decode_frame = self._decoder.decode_native if native else self._decoder.decode
-                    kwargs = {"bytesperline": self._negotiated.bytesperline} if native else {}
+                    kwargs = {"bytesperline": self._negotiated.bytesperline, "output_format": output_format} if native else {}
                     frame_arr = decode_frame(
                         view,
                         self._negotiated.width,

@@ -37,16 +37,22 @@ def _size(value: str) -> tuple[int, int]:
 
 def _best_mode(info, effect_name: str, pixel_format: str | None, size: tuple[int, int] | None):
     formats = ("RGB3",) if effect_name in _MODEL_EFFECTS else NATIVE_PIXEL_FORMATS
+    if effect_name in _MODEL_EFFECTS and pixel_format not in (None, "RGB3"):
+        return None
     modes = [
         mode
         for mode in info.modes
-        if mode.pixel_format in formats
-        and (pixel_format is None or mode.pixel_format == pixel_format)
+        if (mode.pixel_format == "MJPG" or mode.pixel_format in formats)
+        and (pixel_format is None or mode.pixel_format == "MJPG" or mode.pixel_format == pixel_format)
         and (size is None or (mode.width, mode.height) == size)
     ]
     return max(
         modes,
-        key=lambda mode: (mode.width * mode.height, max(mode.fps_options, default=0.0)),
+        key=lambda mode: (
+            mode.width * mode.height,
+            max(mode.fps_options, default=0.0),
+            mode.pixel_format == "MJPG",
+        ),
         default=None,
     )
 
@@ -57,6 +63,7 @@ def _benchmark_one(
     camera: str,
     mode,
     *,
+    pixel_format: str | None,
     duration_s: float,
     warmup_frames: int,
     variant: str,
@@ -65,6 +72,11 @@ def _benchmark_one(
 ) -> None:
     effect = None
     try:
+        process_format = (
+            "RGB3"
+            if effect_name in _MODEL_EFFECTS
+            else (pixel_format or ("YUYV" if mode.pixel_format == "MJPG" else mode.pixel_format))
+        )
         options: dict[str, object] = {}
         if effect_name in _MODEL_EFFECTS:
             options.update(
@@ -90,7 +102,7 @@ def _benchmark_one(
 
             def run_one(index: int) -> None:
                 nonlocal dropped
-                captured = capture.read_frame(native=True, timeout_s=3.0)
+                captured = capture.read_frame(native=True, output_format=process_format, timeout_s=3.0)
                 dropped += captured.dropped_since_last
                 if captured.data is None:
                     return
@@ -100,7 +112,7 @@ def _benchmark_one(
                     width=captured.width,
                     height=captured.height,
                     fps=negotiated.fps,
-                    pixel_format=negotiated.pixel_format,
+                    pixel_format=process_format,
                 )
                 start = time.perf_counter()
                 output = effect.process(captured.data, context)
@@ -132,7 +144,9 @@ def _benchmark_one(
                 p95_ms = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
                 print(
                     f"{effect_name:16s} {backend:4s} {negotiated.width}x{negotiated.height} "
-                    f"{negotiated.pixel_format:4s} camera={frames / elapsed_s:5.2f} fps "
+                    f"{negotiated.pixel_format:4s}"
+                    f"{f'->{process_format}' if negotiated.pixel_format != process_format else '     '} "
+                    f"camera={frames / elapsed_s:5.2f} fps "
                     f"effect={avg_ms:8.2f} ms avg / {p95_ms:8.2f} ms p95 "
                     f"({1000.0 / avg_ms:5.2f} effect fps) dropped={dropped}",
                     flush=True,
@@ -153,7 +167,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-device", default="", help="Camera node; default is the best accessible camera")
     parser.add_argument("--size", type=_size, help="Force a supported camera size, e.g. 1280x720")
-    parser.add_argument("--pixel-format", choices=NATIVE_PIXEL_FORMATS, help="Force a native camera format")
+    parser.add_argument(
+        "--pixel-format",
+        choices=NATIVE_PIXEL_FORMATS,
+        help="Force the processing format; MJPG camera frames are decoded to this format with PyAV",
+    )
     parser.add_argument("--duration", type=float, default=3.0, help="Timed seconds for each effect/backend")
     parser.add_argument("--warmup-frames", type=int, default=3, help="Unmeasured frames before each run")
     parser.add_argument("--variant", choices=("small", "base", "large"), default="small")
@@ -185,7 +203,10 @@ def main() -> int:
         if mode is None:
             expected_formats = "RGB3" if effect_name in _MODEL_EFFECTS else ", ".join(NATIVE_PIXEL_FORMATS)
             for backend in backends:
-                print(f"{effect_name:16s} {backend:4s} SKIPPED: camera has no matching mode ({expected_formats})")
+                print(
+                    f"{effect_name:16s} {backend:4s} SKIPPED: no raw mode in ({expected_formats}) "
+                    "or MJPG mode for PyAV decoding"
+                )
             continue
         for backend in backends:
             if not is_device_available(backend):
@@ -196,6 +217,7 @@ def main() -> int:
                 backend,
                 info.path,
                 mode,
+                pixel_format=args.pixel_format,
                 duration_s=args.duration,
                 warmup_frames=args.warmup_frames,
                 variant=args.variant,

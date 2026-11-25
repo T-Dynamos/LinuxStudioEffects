@@ -218,6 +218,11 @@ class VirtualCameraOutput:
                     f"{dev_path} negotiated {actual_format} instead of requested {fmt_name}; "
                     "format conversion is disabled"
                 )
+            if (fmt.fmt.pix.width, fmt.fmt.pix.height) != (self._requested.width, self._requested.height):
+                raise RuntimeError(
+                    f"{dev_path} negotiated {fmt.fmt.pix.width}x{fmt.fmt.pix.height} instead of requested "
+                    f"{self._requested.width}x{self._requested.height}; resolution changes are disabled"
+                )
 
             actual_fps = self._configure_fps(fd, self._requested.fps)
 

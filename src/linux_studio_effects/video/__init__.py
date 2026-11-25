@@ -19,7 +19,7 @@ from .capabilities import (
     summarize_camera_capabilities,
     summarize_device_capabilities,
 )
-from .decoder import FrameDecoder, decode_yuyv_to_rgb, has_turbojpeg
+from .decoder import FrameDecoder, decode_yuyv_to_rgb, has_pyav
 from .deps import CameraDepsReport, CheckItem, check_camera_deps, format_deps_report
 from .effects.base import (
     CallableEffect,
@@ -126,7 +126,7 @@ __all__ = [
     "format_benchmark_result",
     "format_camera_summary",
     "format_deps_report",
-    "has_turbojpeg",
+    "has_pyav",
     "is_device_available",
     "load_effect_backend",
     "list_loopback_devices",

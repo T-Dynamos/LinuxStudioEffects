@@ -20,21 +20,26 @@
 
 ## Live video formats
 
-- The live `VideoPipeline` path does not convert between color spaces. It
-  captures native `YUYV`, `UYVY`, `RGB3`, or `BGR3` frames and writes the same
-  format to the output. Input/output FourCC, colorspace, YCbCr encoding, and
-  quantization range must match after resolving V4L2 default values. Drivers
-  may canonicalize transfer-function metadata to DEFAULT.
+- The live `VideoPipeline` path supports native `YUYV`, `UYVY`, `RGB3`, and
+  `BGR3` capture and output. Native input/output FourCC, colorspace, YCbCr
+  encoding, and quantization range must match after resolving V4L2 default
+  values. Drivers may canonicalize transfer-function metadata to DEFAULT.
+  Capture and output negotiation must preserve requested dimensions; fail
+  instead of silently accepting a different size.
+- Compressed `MJPG` camera modes are decoded and reformatted through PyAV
+  (FFmpeg) into a supported native output format. Do not add hand-written
+  MJPEG, YUV, or RGB conversion routines. Keep the requested capture and output
+  dimensions equal unless a user explicitly requests a resize.
 - Use `video/pixels.py` for packed-frame layout, YUYV/UYVY plane access, and
   same-format resizing. A YUYV/UYVY array has shape `(height, width // 2, 4)`;
   RGB3/BGR3 has shape `(height, width, 3)`. Packed 4:2:2 widths must be even.
-- Effects must preserve their input FourCC and packed layout. If a backend
+- Effects must preserve their processing FourCC and packed layout. If a backend
   needs a model-friendly view of YUYV/UYVY, use luma directly instead of
   decoding to RGB. Keep optional RGB decode/encode helpers out of the live
   capture-to-loopback path.
-- Keep examples and hardware tests from offering mismatched input/output
-  formats. For effects that only accept RGB, choose an RGB3 camera mode or
-  explain that no matching mode is available; do not add an implicit convert.
+- Keep examples and hardware tests from silently mismatching native input and
+  output formats. For effects that only accept RGB, select RGB3 or use the
+  PyAV path when the camera exposes MJPG instead.
 
 ## NPU and XRT
 

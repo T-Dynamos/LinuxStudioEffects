@@ -295,9 +295,9 @@ def install_python_toolchain(
     channel: str,
     target_ref: str,
 ) -> None:
-    """Install latest numpy/ml_dtypes/cloudpickle, mlir_aie wheel, and llvm-aie (Peano)."""
+    """Install core Python/MLIR-AIE packages and PyAV for camera decoding."""
     log("Installing Python runtime packages, mlir_aie, and llvm-aie...")
-    pip_install(venv_dir, preflight, ["-U", "pip", "numpy>=2.5.3,<3.0", "ml_dtypes>=0.6.0", "cloudpickle"])
+    pip_install(venv_dir, preflight, ["-U", "pip", "numpy>=2.5.3,<3.0", "ml_dtypes>=0.6.0", "cloudpickle", "av>=14"])
 
     if channel == "latest":
         pip_install(venv_dir, preflight, ["-U", "--pre", "mlir_aie", "-f", MLIR_AIE_LATEST_WHEELS])

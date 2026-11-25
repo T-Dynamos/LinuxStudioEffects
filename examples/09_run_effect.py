@@ -149,12 +149,16 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="List effects and implemented backends")
     parser.add_argument("--effect", choices=sorted(catalog), default="mirror")
     parser.add_argument("--device", choices=("auto", "cpu", "gpu", "npu"), default="auto")
-    parser.add_argument("--in-size", type=_size, help="Camera input size; defaults to 1920x1080 when available")
+    parser.add_argument(
+        "--in-size",
+        type=_size,
+        default=(1920, 1080),
+        help="Camera input size (default 1920x1080; must be an advertised mode, including MJPG)",
+    )
     parser.add_argument(
         "--out-size",
         type=_size,
-        default=(1920, 1080),
-        help="Virtual camera output size (default 1920x1080)",
+        help="Output size; if provided it must match the input size",
     )
     parser.add_argument("--fps", type=float, help="Frame rate; default request is 30 fps")
     parser.add_argument("--frames", type=int, default=0, help="Process synthetic frames without camera hardware")
@@ -166,7 +170,7 @@ def main() -> int:
     parser.add_argument(
         "--pixel-format",
         choices=NATIVE_PIXEL_FORMATS,
-        help="Use this exact uncompressed format for both camera and virtual camera; default selects a shared mode",
+        help="Decoded/output pixel format; MJPG camera modes are decoded to this format with PyAV",
     )
     parser.add_argument(
         "--output-device",
@@ -181,6 +185,8 @@ def main() -> int:
         return 0
     if args.frames < 0 or (args.fps is not None and args.fps <= 0) or args.duration < 0:
         parser.error("--frames and --duration must be >= 0, and --fps must be positive")
+    if args.out_size is not None and args.out_size != args.in_size:
+        parser.error("Input and output resolutions must match; set --in-size and --out-size to the same WxH")
 
     model_options: dict[str, object] = {}
     if args.effect in {"video_depth", "portrait_blur"}:
@@ -209,17 +215,18 @@ def main() -> int:
     effect_formats = ("RGB3",) if args.effect in {"video_depth", "portrait_blur"} else NATIVE_PIXEL_FORMATS
     compatible_modes = [
         mode for mode in camera_info.modes
-        if mode.pixel_format in effect_formats
-        and (args.pixel_format is None or mode.pixel_format == args.pixel_format)
+        if (mode.pixel_format in NATIVE_PIXEL_FORMATS or mode.pixel_format == "MJPG")
+        and (mode.pixel_format == "MJPG" or mode.pixel_format in effect_formats)
+        and (args.pixel_format is None or mode.pixel_format == "MJPG" or mode.pixel_format == args.pixel_format)
         and (args.in_size is None or (mode.width, mode.height) == args.in_size)
     ]
     if not compatible_modes:
         requested = f" at {args.in_size[0]}x{args.in_size[1]}" if args.in_size else ""
         parser.error(
-            f"Camera {camera} has no uncompressed mode{requested} shared with the output formats "
-            f"{', '.join(effect_formats)}. Color conversion is disabled."
+            f"Camera {camera} has no compatible raw or MJPG mode{requested}. "
+            f"PyAV can decode MJPG to {', '.join(effect_formats)}; install project dependencies if PyAV is missing."
         )
-    preferred_size = args.in_size or (1920, 1080)
+    preferred_size = args.in_size
     selected_mode = max(
         compatible_modes,
         key=lambda mode: (
@@ -227,15 +234,21 @@ def main() -> int:
             max(mode.fps_options, default=0.0) >= 29.5,
             mode.width * mode.height,
             max(mode.fps_options, default=0.0),
+            mode.pixel_format != "MJPG",
             mode.pixel_format == "YUYV",
         ),
     )
     input_width, input_height = selected_mode.width, selected_mode.height
     input_format = selected_mode.pixel_format
+    output_format = args.pixel_format or (
+        "RGB3" if args.effect in {"video_depth", "portrait_blur"} else ("YUYV" if input_format == "MJPG" else input_format)
+    )
     fps = args.fps if args.fps is not None else 30.0
-    output_width, output_height = args.out_size
-    if is_yuv422(input_format) and output_width % 2:
-        parser.error(f"{input_format} requires an even output width")
+    if args.out_size is not None and args.out_size != (input_width, input_height):
+        parser.error("Input and output resolutions must match; set --in-size and --out-size to the same WxH")
+    output_width, output_height = input_width, input_height
+    if is_yuv422(output_format) and output_width % 2:
+        parser.error(f"{output_format} requires an even output width")
 
     config = PipelineConfig(
         input_device=camera,
@@ -245,7 +258,7 @@ def main() -> int:
         output_device=loopback,
         output_width=output_width,
         output_height=output_height,
-        output_format=input_format,
+        output_format=output_format,
         input_fps=fps,
         output_fps=fps,
     )
@@ -259,7 +272,8 @@ def main() -> int:
         )
 
     print(
-        f"Using {camera} at {input_width}x{input_height} {input_format} -> "
+        f"Using {camera} at {input_width}x{input_height} {input_format}"
+        f"{f' (PyAV -> {output_format})' if input_format == 'MJPG' or input_format != output_format else ''} -> "
         f"{loopback} at {output_width}x{output_height} ({fps:g} fps)",
         flush=True,
     )

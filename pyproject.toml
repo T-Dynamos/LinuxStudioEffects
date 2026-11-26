@@ -11,5 +11,9 @@ license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = ["av>=14"]
 
+[project.scripts]
+lse = "linux_studio_effects.tui:main"
+lse-ui = "linux_studio_effects.tui:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

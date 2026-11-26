@@ -52,6 +52,7 @@ class PipelineStats:
     output_fps: float
     avg_process_ms: float
     cpu_percent: float
+    avg_lag_ms: float = 0.0
 
 
 def _colorimetry_signature(config: CameraConfig | VirtualCameraConfig, pixel_format: str) -> tuple[int, int, int]:
@@ -187,6 +188,7 @@ class VideoPipeline:
             frames_out = 0
             dropped_in = 0
             proc_ms_samples: list[float] = []
+            lag_ms_samples: list[float] = []
 
             target_out_period = (1.0 / cfg.output_fps) if cfg.output_fps > 0 else 0.0
             next_out_deadline = wall_start
@@ -233,7 +235,9 @@ class VideoPipeline:
                                 mode=cfg.resize_mode,
                             )
                         vcam.write_frame(out_frame)
-                        proc_ms_samples.append((time.perf_counter() - t0) * 1000.0)
+                        end_now = time.perf_counter()
+                        proc_ms_samples.append((end_now - t0) * 1000.0)
+                        lag_ms_samples.append(max(0.0, (time.monotonic() - frame_now) * 1000.0))
                         frames_out += 1
 
                         if target_out_period > 0.0:
@@ -257,6 +261,7 @@ class VideoPipeline:
                                 output_fps=(frames_out - last_report_out) / dt,
                                 avg_process_ms=statistics.fmean(proc_ms_samples[-30:]) if proc_ms_samples else 0.0,
                                 cpu_percent=(d_cpu / dt) * 100.0,
+                                avg_lag_ms=statistics.fmean(lag_ms_samples[-30:]) if lag_ms_samples else 0.0,
                             )
                         )
                         last_report_wall = frame_now
@@ -282,6 +287,7 @@ class VideoPipeline:
                 output_fps=frames_out / total_wall,
                 avg_process_ms=statistics.fmean(proc_ms_samples) if proc_ms_samples else 0.0,
                 cpu_percent=(total_cpu / total_wall) * 100.0,
+                avg_lag_ms=statistics.fmean(lag_ms_samples) if lag_ms_samples else 0.0,
             )
 
 

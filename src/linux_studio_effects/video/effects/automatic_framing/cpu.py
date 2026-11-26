@@ -276,6 +276,14 @@ class AutomaticFramingEffect(FrameEffect):
     def tracker_updates(self) -> int:
         return self._worker.updates
 
+    @property
+    def tracker_lag_frames(self) -> int:
+        return self._worker.lag_frames
+
+    @property
+    def tracker_lag_ms(self) -> float:
+        return self._worker.lag_ms
+
     def setup(self, width: int, height: int, fps: float) -> None:
         super().setup(width, height, fps)
         self._worker.stop()

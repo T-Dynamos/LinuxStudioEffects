@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import threading
-import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,12 +10,12 @@ from ...models.video_depth_anything import host_ops
 from ...models.video_depth_anything.config import VideoDepthConfig, get_video_depth_config
 from ...models.video_depth_anything.model import InferenceResult, VideoDepthAnythingModel
 from ...models.video_depth_anything.weights import VideoDepthWeights, create_synthetic_weights, load_from_hf
+from ...models.video_depth_anything.worker import AsyncDepthWorker
 from ...pixels import (
     NATIVE_PIXEL_FORMATS,
     channels_to_frame,
     frame_to_channels,
     is_yuv422,
-    model_luma_input,
     split_yuv422,
 )
 from ..base import ComputeDevice, FrameContext, FrameEffect
@@ -106,55 +104,16 @@ def _resize_hwc_u8(arr: np.ndarray, plan: _BilinearPlan) -> np.ndarray:
 
 
 def _box_filter_2d(arr: np.ndarray, radius: int) -> np.ndarray:
-    """O(H*W) separable box filter with edge clamping using cumulative sums."""
-    if radius <= 0:
-        return arr
-    h, w = arr.shape
-    win = float(2 * radius + 1)
-
-    px = np.pad(arr, ((0, 0), (radius, radius)), mode="edge")
-    cs_x = np.empty((h, w + 2 * radius + 1), dtype=np.float32)
-    cs_x[:, 0] = 0.0
-    np.cumsum(px, axis=1, dtype=np.float32, out=cs_x[:, 1:])
-    blur_x = (cs_x[:, 2 * radius + 1 :] - cs_x[:, :w]) / np.float32(win)
-
-    py = np.pad(blur_x, ((radius, radius), (0, 0)), mode="edge")
-    cs_y = np.empty((h + 2 * radius + 1, w), dtype=np.float32)
-    cs_y[0, :] = 0.0
-    np.cumsum(py, axis=0, dtype=np.float32, out=cs_y[1:, :])
-    return (cs_y[2 * radius + 1 :, :] - cs_y[:h, :]) / np.float32(win)
+    """O(H*W) separable box filter with edge clamping."""
+    return host_ops.box_filter_2d(arr, radius)
 
 
 def _downsample2x_hw4(arr: np.ndarray) -> np.ndarray:
-    h, w, _ = arr.shape
-    pad_h = h & 1
-    pad_w = w & 1
-    if pad_h or pad_w:
-        arr = np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
-    return np.float32(0.25) * (arr[0::2, 0::2] + arr[0::2, 1::2] + arr[1::2, 0::2] + arr[1::2, 1::2])
+    return host_ops.downsample2x_hw4(arr)
 
 
 def _gaussian5_hw4(arr: np.ndarray, passes: int = 1) -> np.ndarray:
-    cur = arr
-    scale = np.float32(1.0 / 16.0)
-    for _ in range(passes):
-        px = np.pad(cur, ((0, 0), (2, 2), (0, 0)), mode="edge")
-        cur = (
-            px[:, :-4]
-            + np.float32(4.0) * px[:, 1:-3]
-            + np.float32(6.0) * px[:, 2:-2]
-            + np.float32(4.0) * px[:, 3:-1]
-            + px[:, 4:]
-        ) * scale
-        py = np.pad(cur, ((2, 2), (0, 0), (0, 0)), mode="edge")
-        cur = (
-            py[:-4, :]
-            + np.float32(4.0) * py[1:-3, :]
-            + np.float32(6.0) * py[2:-2, :]
-            + np.float32(4.0) * py[3:-1, :]
-            + py[4:, :]
-        ) * scale
-    return cur
+    return host_ops.gaussian5_hw4(arr, passes=passes)
 
 
 def _composite_cpu_u8(
@@ -243,13 +202,7 @@ class PortraitBlurEffect(FrameEffect):
         self.local_files_only = local_files_only
         self._explicit_weights = weights
 
-        self._depth_lock = threading.Lock()
-        self._latest_frame: tuple[np.ndarray, str] | None = None
-        self._latest_depth: np.ndarray | None = None
-        self._depth_updates: int = 0
-        self._stop_event = threading.Event()
-        self._frame_ready_event = threading.Event()
-        self._depth_thread: threading.Thread | None = None
+        self._depth_worker = AsyncDepthWorker(depth_interval_s, thread_name="vda-depth-worker")
 
         self.set_params(
             blur_strength=blur_strength,
@@ -275,9 +228,6 @@ class PortraitBlurEffect(FrameEffect):
         self._model: VideoDepthAnythingModel | None = None
         self.last_result: InferenceResult | None = None
         self.last_coc: np.ndarray | None = None
-        self._stop_event = threading.Event()
-        self._frame_ready_event = threading.Event()
-        self._depth_thread: threading.Thread | None = None
 
         self._frame_shape: tuple[int, int] | None = None
         self._plan_full_to_low: _BilinearPlan | None = None
@@ -373,13 +323,14 @@ class PortraitBlurEffect(FrameEffect):
         if "async_depth" in params:
             new_async = bool(params["async_depth"])
             if getattr(self, "async_depth", False) and not new_async:
-                self._stop_depth_worker()
+                self._depth_worker.stop()
             self.async_depth = new_async
         if "depth_interval_s" in params:
             val = float(params["depth_interval_s"])  # type: ignore[arg-type]
             if val < 0.0:
                 raise ValueError(f"depth_interval_s must be >= 0, got {val}")
             self.depth_interval_s = val
+            self._depth_worker.interval_s = val
         unknown = set(params) - {
             "blur_strength",
             "blur_passes",
@@ -436,7 +387,7 @@ class PortraitBlurEffect(FrameEffect):
 
     def setup(self, width: int, height: int, fps: float) -> None:
         super().setup(width, height, fps)
-        self._stop_depth_worker()
+        self._depth_worker.stop()
         self._reset_temporal_bokeh_state()
 
         if self._model is None:
@@ -504,23 +455,7 @@ class PortraitBlurEffect(FrameEffect):
         coc_raw = (t * t * (np.float32(3.0) - np.float32(2.0) * t)).astype(np.float32, copy=False)
 
         fmt = pixel_format.upper()
-        if is_yuv422(fmt):
-            y_plane, _, _ = split_yuv422(frame, fmt)
-            luma_full = y_plane.astype(np.float32) * np.float32(1.0 / 255.0)
-        elif fmt == "BGR3":
-            luma_full = (
-                frame[:, :, 0] * np.float32(0.114 / 255.0)
-                + frame[:, :, 1] * np.float32(0.587 / 255.0)
-                + frame[:, :, 2] * np.float32(0.299 / 255.0)
-            )
-        else:
-            luma_full = (
-                frame[:, :, 0] * np.float32(0.299 / 255.0)
-                + frame[:, :, 1] * np.float32(0.587 / 255.0)
-                + frame[:, :, 2] * np.float32(0.114 / 255.0)
-            )
-        assert self._plan_full_to_low is not None and self._plan_low_to_full is not None
-        luma_low = _resize_2d(luma_full, self._plan_full_to_low)
+        luma_full, luma_low = host_ops.extract_luma_and_downsample(frame, fmt, s, s)
 
         if self._prev_luma_low is not None and self._prev_coc_low is not None:
             diff_luma = np.abs(luma_low - self._prev_luma_low)
@@ -535,19 +470,15 @@ class PortraitBlurEffect(FrameEffect):
 
         if self.edge_refine:
             radius = self.edge_refine_radius if self.edge_refine_radius is not None else max(2, s // 32)
-            eps = np.float32(self.edge_refine_eps)
-            mean_i = _box_filter_2d(luma_low, radius)
-            mean_p = _box_filter_2d(coc_low, radius)
-            corr_i = _box_filter_2d(luma_low * luma_low, radius)
-            corr_ip = _box_filter_2d(luma_low * coc_low, radius)
-            var_i = np.maximum(corr_i - mean_i * mean_i, np.float32(0.0))
-            cov_ip = corr_ip - mean_i * mean_p
-            a_low = cov_ip / (var_i + eps)
-            b_low = mean_p - a_low * mean_i
-            mean_a = _resize_2d(_box_filter_2d(a_low, radius), self._plan_low_to_full)
-            mean_b = _resize_2d(_box_filter_2d(b_low, radius), self._plan_low_to_full)
-            coc_full = np.clip(mean_a * luma_full + mean_b, 0.0, 1.0)
+            coc_full = host_ops.guided_upsample_coc(
+                luma_full,
+                luma_low,
+                coc_low,
+                radius,
+                float(self.edge_refine_eps),
+            )
         else:
+            assert self._plan_low_to_full is not None
             coc_full = np.clip(_resize_2d(coc_low, self._plan_low_to_full), 0.0, 1.0)
 
         if self.mask_gamma != 1.0:
@@ -564,17 +495,14 @@ class PortraitBlurEffect(FrameEffect):
         bg_mask = np.clip((coc_unscaled - np.float32(0.02)) * np.float32(self.halo_suppression), 0.0, 1.0)
         w0 = bg_mask * np.float32(1.0 - 1e-3) + np.float32(1e-3)
 
-        s1 = _gaussian5_hw4(host_ops.downsample2x_bg_hw4(frame, w0), passes=passes_1)
-        l1_small = s1[:, :, :3] / np.maximum(s1[:, :, 3:4], np.float32(1e-5))
-        l1 = _resize_hwc_u8(l1_small, p1)
+        s1 = host_ops.gaussian5_hw4(host_ops.downsample2x_bg_hw4(frame, w0), passes=passes_1)
+        l1 = host_ops.unpremul_resize_hw4_to_rgb_u8(s1, p1.out_h, p1.out_w)
 
-        s2 = _gaussian5_hw4(_downsample2x_hw4(s1), passes=passes_2)
-        l2_small = s2[:, :, :3] / np.maximum(s2[:, :, 3:4], np.float32(1e-5))
-        l2 = _resize_hwc_u8(l2_small, p2)
+        s2 = host_ops.gaussian5_hw4(host_ops.downsample2x_hw4(s1), passes=passes_2)
+        l2 = host_ops.unpremul_resize_hw4_to_rgb_u8(s2, p2.out_h, p2.out_w)
 
-        s3 = _gaussian5_hw4(_downsample2x_hw4(_downsample2x_hw4(s2)), passes=passes_3)
-        l3_small = s3[:, :, :3] / np.maximum(s3[:, :, 3:4], np.float32(1e-5))
-        l3 = _resize_hwc_u8(l3_small, p3)
+        s3 = host_ops.gaussian5_hw4(host_ops.downsample2x_hw4(host_ops.downsample2x_hw4(s2)), passes=passes_3)
+        l3 = host_ops.unpremul_resize_hw4_to_rgb_u8(s3, p3.out_h, p3.out_w)
 
         return l1, l2, l3
 
@@ -588,52 +516,17 @@ class PortraitBlurEffect(FrameEffect):
     ) -> np.ndarray:
         return _composite_cpu_u8(l0, l1, l2, l3, coc_u8)
 
-    def _start_depth_worker(self) -> None:
-        if self._depth_thread is not None:
-            return
-        self._stop_event.clear()
-        self._frame_ready_event.clear()
-
-        def _worker() -> None:
-            while not self._stop_event.is_set():
-                if not self._frame_ready_event.wait(timeout=0.05):
-                    continue
-                self._frame_ready_event.clear()
-                with self._depth_lock:
-                    snap = self._latest_frame
-                if snap is None or self._model is None:
-                    continue
-                raw_frame, raw_fmt = snap
-                t0 = time.perf_counter()
-                model_input = model_luma_input(raw_frame, raw_fmt)
-                res = self._model.infer(model_input)
-                with self._depth_lock:
-                    self._latest_depth = res.depth
-                    self.last_result = res
-                    self._depth_updates += 1
-                elapsed = time.perf_counter() - t0
-                rem = self.depth_interval_s - elapsed
-                if rem > 0.0:
-                    self._stop_event.wait(rem)
-
-        self._depth_thread = threading.Thread(target=_worker, daemon=True, name="vda-depth-worker")
-        self._depth_thread.start()
-
-    def _stop_depth_worker(self) -> None:
-        self._stop_event.set()
-        self._frame_ready_event.set()
-        if self._depth_thread is not None:
-            self._depth_thread.join(timeout=5.0)
-            self._depth_thread = None
-        with self._depth_lock:
-            self._latest_frame = None
-            self._latest_depth = None
-            self._depth_updates = 0
-
     @property
     def depth_updates(self) -> int:
-        with self._depth_lock:
-            return self._depth_updates
+        return self._depth_worker.updates
+
+    @property
+    def depth_lag_frames(self) -> int:
+        return self._depth_worker.lag_frames
+
+    @property
+    def depth_lag_ms(self) -> float:
+        return self._depth_worker.lag_ms
 
     def apply_depth_bokeh(
         self,
@@ -693,32 +586,12 @@ class PortraitBlurEffect(FrameEffect):
             self.setup(w, h, ctx.fps if ctx else 30.0)
         assert self._model is not None
 
-        if not self.async_depth:
-            model_input = model_luma_input(frame, pixel_format)
-            res = self._model.infer(model_input)
-            self.last_result = res
-            self._depth_updates += 1
-            return self.apply_depth_bokeh(frame, res.depth, pixel_format=pixel_format)
-
-        frame_copy = frame.copy()
-        with self._depth_lock:
-            depth = self._latest_depth
-            self._latest_frame = (frame_copy, pixel_format)
-        if depth is None:
-            model_input = model_luma_input(frame_copy, pixel_format)
-            res = self._model.infer(model_input)
-            with self._depth_lock:
-                self._latest_depth = res.depth
-                self.last_result = res
-                self._depth_updates += 1
-                depth = res.depth
-            self._start_depth_worker()
-        else:
-            self._frame_ready_event.set()
-        return self.apply_depth_bokeh(frame, depth, pixel_format=pixel_format)
+        res = self._depth_worker.step(self._model, frame, pixel_format, async_enabled=self.async_depth)
+        self.last_result = res
+        return self.apply_depth_bokeh(frame, res.depth, pixel_format=pixel_format)
 
     def teardown(self) -> None:
-        self._stop_depth_worker()
+        self._depth_worker.stop()
         self._reset_temporal_bokeh_state()
         self._frame_shape = None
         self._plan_full_to_low = None

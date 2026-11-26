@@ -281,6 +281,7 @@ class VideoDepthAnythingModel:
         # Preallocated rolling (d, 32, ch) K/V buffers per temporal attention slot
         self._kv_work: list[tuple[np.ndarray, np.ndarray]] = []
         self._slot1_id: int | None = None
+        self._kv_ring_cursor: int = 2
 
         if self.backend == "npu":
             self._npu_mm = NpuMatMulExecutor()
@@ -294,6 +295,7 @@ class VideoDepthAnythingModel:
         self._frame_cache_list.clear()
         self._kv_work.clear()
         self._slot1_id = None
+        self._kv_ring_cursor = 2
 
     def _init_torch_gpu(self) -> None:
         import torch  # type: ignore[import-not-found]
@@ -392,14 +394,14 @@ class VideoDepthAnythingModel:
         padding: int = 0,
         apply_relu: bool = False,
     ) -> np.ndarray:
-        """Conv2d wrapper routing high-FLOP 3x3 s=1 p=1 and 1x1 convolutions (C_out >= 128) to NPU."""
+        """Conv2d wrapper routing high-FLOP 3x3 s=1 p=1 (C_out >= 32) and 1x1 (C_out >= 128) convolutions to NPU."""
         _, c_in, h, w = x.shape
         c_out, _, kh, kw = w4.shape
         w_mat = self._conv_wt(w4)
 
-        if self._npu_mm is not None and stride == 1 and c_out >= 128:
+        if self._npu_mm is not None and stride == 1:
             macs = c_out * c_in * kh * kw * h * w
-            if kh == 3 and kw == 3 and padding == 1 and macs >= _NPU_CONV_MIN_MACS:
+            if kh == 3 and kw == 3 and padding == 1 and c_out >= 32 and macs >= _NPU_CONV_MIN_MACS:
                 return self._npu_mm.conv2d_3x3_s1_p1_nchw(
                     x,
                     self._conv_kykxc_wt(w4),
@@ -407,7 +409,7 @@ class VideoDepthAnythingModel:
                     bias=bias,
                     apply_relu=apply_relu,
                 )
-            if kh == 1 and kw == 1 and padding == 0 and macs >= _NPU_CONV_MIN_MACS:
+            if kh == 1 and kw == 1 and padding == 0 and c_out >= 128 and macs >= _NPU_CONV_MIN_MACS:
                 return self._npu_mm.matmul(
                     x.reshape(c_in, h * w),
                     self._wt(w_mat),
@@ -442,6 +444,8 @@ class VideoDepthAnythingModel:
     def preprocess(self, rgb: np.ndarray) -> np.ndarray:
         """Resize (H, W, 3) uint8 RGB frame to (1, 3, S, S) normalized float32."""
         s = self.config.input_size
+        if rgb.dtype == np.uint8:
+            return host_ops.preprocess_rgb_u8_to_nchw(rgb, s, s)
         h, w, _ = rgb.shape
         x = (rgb.astype(np.float32) * (1.0 / 255.0)).transpose(2, 0, 1)[None, :, :, :]
         if h != s or w != s:
@@ -478,15 +482,8 @@ class VideoDepthAnythingModel:
             h_norm = _layer_norm(x, blk.norm1_weight, blk.norm1_bias, cfg.layer_norm_eps)
 
             # Fused QKV projection: 1 dispatch per block (weights already packed in .pth)
-            qkv = self._linear(h_norm, blk.qkv_weight, blk.qkv_bias)
-            q, k, v = np.split(qkv, 3, axis=-1)
-
-            qh = q.reshape(n_tok, cfg.num_heads, cfg.head_dim).transpose(1, 0, 2)
-            kh = k.reshape(n_tok, cfg.num_heads, cfg.head_dim).transpose(1, 2, 0)
-            vh = v.reshape(n_tok, cfg.num_heads, cfg.head_dim).transpose(1, 0, 2)
-
-            attn = _softmax((qh @ kh) * scale)
-            ctx = (attn @ vh).transpose(1, 0, 2).reshape(n_tok, cfg.embed_dim)
+            qkv = np.ascontiguousarray(self._linear(h_norm, blk.qkv_weight, blk.qkv_bias), dtype=np.float32)
+            ctx = host_ops.fused_mha_qkv(qkv, cfg.num_heads, cfg.head_dim, float(scale))
             attn_out = self._linear(ctx, blk.proj_weight, blk.proj_bias)
             x = x + attn_out * blk.ls1
 
@@ -532,7 +529,7 @@ class VideoDepthAnythingModel:
             self._kv_work[slot] = (k_buf, v_buf)
 
         if not has_history:
-            attn_out = host_ops.temporal_attn_roll(
+            attn_out = host_ops.temporal_attn_roll_ring(
                 k_cur_raw,
                 k_cur_raw,
                 v_cur_raw,
@@ -543,10 +540,11 @@ class VideoDepthAnythingModel:
                 n_heads,
                 scale,
                 False,
+                cursor=2,
             )
         else:
             q = np.ascontiguousarray(self._proj(x_dc + actx.pe[_INFER_LEN - 1], actx.w_q_t))
-            attn_out = host_ops.temporal_attn_roll(
+            attn_out = host_ops.temporal_attn_roll_ring(
                 q,
                 k_cur_raw,
                 v_cur_raw,
@@ -557,6 +555,7 @@ class VideoDepthAnythingModel:
                 n_heads,
                 scale,
                 True,
+                cursor=self._kv_ring_cursor,
             )
 
         out = self._proj(attn_out, actx.w_out_t, actx.b_out)
@@ -625,6 +624,8 @@ class VideoDepthAnythingModel:
                     k_buf[:, 1, :] = slot1[slot][0]
                     v_buf[:, 1, :] = slot1[slot][1]
                 self._slot1_id = id(slot1)
+        else:
+            self._kv_ring_cursor = 2
 
         # 1. Projects + Resize
         reassembled: list[np.ndarray] = []
@@ -703,6 +704,8 @@ class VideoDepthAnythingModel:
         )
 
         new_cache = kv_m0 + kv_m1 + kv_m2 + kv_m3
+        if has_history:
+            self._kv_ring_cursor = 2 + ((self._kv_ring_cursor - 2 + 1) % (_INFER_LEN - 3))
         return out[0, 0], new_cache
 
     def infer(self, rgb: np.ndarray) -> InferenceResult:

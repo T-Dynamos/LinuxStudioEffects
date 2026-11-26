@@ -21,9 +21,9 @@ import urllib.request
 from dataclasses import dataclass
 
 SUPPORTED_PY_MINORS = (14,)
-MLIR_AIE_REPO = "https://github.com/Xilinx/mlir-aie.git"
 MLIR_AIE_LATEST_WHEELS = "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-5"
 MLIR_AIE_RELEASE_URL = "https://github.com/Xilinx/mlir-aie/releases"
+MLIR_AIE_RAW_URL = "https://raw.githubusercontent.com/Xilinx/mlir-aie"
 LLVM_AIE_NIGHTLY = "https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly"
 XRT_BUNDLE_DEFAULT = pathlib.Path("/home/tdynamos/amdnpu/dist/ryzen-ai-xrt-npu1-linux-x86_64.tar")
 XRT_BUNDLE_NAME = "ryzen-ai-xrt-npu1-linux-x86_64"
@@ -208,21 +208,6 @@ def preflight_checks(*, test_only: bool) -> PreflightResult:
         print("  [FAIL] Python: need Python 3.14 or 'uv'")
         die("Install Python 3.14 or 'uv' (https://docs.astral.sh/uv/).")
 
-    if test_only:
-        return PreflightResult(
-            accel_nodes=rw_nodes,
-            vbnv=vbnv,
-            fw_version=fw_version,
-            npu2=npu2,
-            python_spec=python_spec,
-            use_uv=use_uv,
-        )
-
-    if not shutil.which("git"):
-        print("  [FAIL] Tool: 'git' not found")
-        die("'git' is required to clone Xilinx/mlir-aie.")
-    print(f"  [OK]   Git: {shutil.which('git')}")
-
     return PreflightResult(
         accel_nodes=rw_nodes,
         vbnv=vbnv,
@@ -274,28 +259,13 @@ def resolve_latest_mlir_aie_release_tag() -> str:
     return tag
 
 
-def sync_mlir_aie_repo(mlir_aie_dir: pathlib.Path, *, channel: str) -> str:
-    """Shallow-clone or fast-forward Xilinx/mlir-aie to main or latest release tag."""
-    target_ref = "main" if channel == "latest" else resolve_latest_mlir_aie_release_tag()
-    if not (mlir_aie_dir / ".git").exists():
-        log(f"Cloning Xilinx/mlir-aie ({target_ref}) into {mlir_aie_dir}")
-        run(["git", "clone", "--depth", "1", "--branch", target_ref, MLIR_AIE_REPO, str(mlir_aie_dir)])
-    else:
-        log(f"Updating Xilinx/mlir-aie checkout to {target_ref}")
-        run(["git", "-C", str(mlir_aie_dir), "fetch", "--depth", "1", "origin", target_ref])
-        run(["git", "-C", str(mlir_aie_dir), "checkout", "-B", target_ref, "FETCH_HEAD"])
-    return target_ref
-
-
 def install_python_toolchain(
     venv_dir: pathlib.Path,
-    mlir_aie_dir: pathlib.Path,
     preflight: PreflightResult,
     *,
     channel: str,
-    target_ref: str,
 ) -> None:
-    """Install core Python/MLIR-AIE packages and PyAV for camera decoding."""
+    """Install core Python/MLIR-AIE wheels and PyAV without cloning Xilinx/mlir-aie."""
     log("Installing Python runtime packages, mlir_aie, and llvm-aie...")
     pip_install(venv_dir, preflight, ["-U", "pip", "numpy>=2.5.3,<3.0", "ml_dtypes>=0.6.0", "cloudpickle", "av>=14"])
 
@@ -303,13 +273,17 @@ def install_python_toolchain(
         pip_install(venv_dir, preflight, ["-U", "--pre", "mlir_aie", "-f", MLIR_AIE_LATEST_WHEELS])
         pip_install(venv_dir, preflight, ["-U", "--pre", "llvm-aie", "-f", LLVM_AIE_NIGHTLY])
     else:
+        target_ref = resolve_latest_mlir_aie_release_tag()
         ver = target_ref.lstrip("v")
         pip_install(
             venv_dir,
             preflight,
             ["-U", f"mlir_aie=={ver}", "-f", f"{MLIR_AIE_RELEASE_URL}/expanded_assets/{target_ref}"],
         )
-        pip_install(venv_dir, preflight, ["-U", "-r", str(mlir_aie_dir / "utils" / "peano-requirements.txt")])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            req_path = pathlib.Path(tmpdir) / "peano-requirements.txt"
+            fetch_to_file(f"{MLIR_AIE_RAW_URL}/{target_ref}/utils/peano-requirements.txt", req_path, timeout=30)
+            pip_install(venv_dir, preflight, ["-U", "-r", str(req_path)])
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -589,8 +563,47 @@ for _python_dir in (_XRT_PY, _MLIR_PY):
     log(f"Wired bash, fish, and Python startup hooks for bundled XRT in {venv_dir}")
 
 
-def run_npu_tests(venv_dir: pathlib.Path, mlir_aie_dir: pathlib.Path) -> None:
-    """Verify XRT tensor allocation and NPU kernel execution inside a clean env."""
+_INLINE_NPU_JIT_TEST = """
+import numpy as np
+import aie.iron as iron
+from aie.iron import In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron.controlflow import range_
+
+@iron.jit
+def _smoke_copy_add1(a: In, out: Out):
+    n = 64
+    tile_ty = np.ndarray[(n,), np.dtype[np.int32]]
+    of_in = ObjectFifo(tile_ty, name="in")
+    of_out = ObjectFifo(tile_ty, name="out")
+
+    def core(f_in, f_out):
+        ei = f_in.acquire(1)
+        eo = f_out.acquire(1)
+        for i in range_(n):
+            eo[i] = ei[i] + 1
+        f_in.release(1)
+        f_out.release(1)
+
+    worker = Worker(core, [of_in.cons(), of_out.prod()])
+
+    def sequence(buf_in, buf_out, f_in, f_out):
+        f_in.fill(buf_in)
+        f_out.drain(buf_out, wait=True)
+
+    rt = Runtime(sequence, [tile_ty, tile_ty, of_in.prod(), of_out.cons()])
+    return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+src = iron.arange(0, 64, dtype=np.int32, device="npu")
+dst = iron.zeros(64, dtype=np.int32, device="npu")
+_smoke_copy_add1(src, dst)
+got = dst.numpy()
+assert np.array_equal(got, np.arange(1, 65, dtype=np.int32)), got
+print("[test] Inline @iron.jit NPU kernel passed:", got[:6].tolist())
+""".strip()
+
+
+def run_npu_tests(venv_dir: pathlib.Path) -> None:
+    """Verify XRT tensor allocation and NPU JIT kernel execution inside a clean env."""
     log("Running NPU hardware verification tests in isolated environment...")
     with tempfile.TemporaryDirectory() as cache_dir:
         clean_env = {
@@ -616,7 +629,9 @@ def run_npu_tests(venv_dir: pathlib.Path, mlir_aie_dir: pathlib.Path) -> None:
             env=clean_env,
         )
 
-        # Test 2: bash activate + full JIT examples
+        # Test 2: bash activate + full inline @iron.jit NPU compile & run
+        jit_script = pathlib.Path(cache_dir) / "npu_jit_smoke.py"
+        jit_script.write_text(_INLINE_NPU_JIT_TEST, encoding="utf-8")
         script = f"""
 set -euo pipefail
 source "{venv_dir / 'bin' / 'activate'}"
@@ -625,11 +640,8 @@ echo "[test] python: $(which python3) ($(python3 -c 'import sys; print(sys.versi
 echo "[test] xclbinutil: $(which xclbinutil)"
 echo "[test] NPU_RUNTIME=${{NPU_RUNTIME}} NPU2=${{NPU2}} XRT_ROOT=${{XRT_ROOT}}"
 
-echo "[test] Running vector_scalar_add (fresh JIT compile + NPU run)..."
-python3 "{mlir_aie_dir / 'programming_examples' / 'basic' / 'vector_scalar_add' / 'vector_scalar_add.py'}" --problem-size 2048
-
-echo "[test] Running vector_vector_add (fresh JIT compile + NPU run)..."
-python3 "{mlir_aie_dir / 'programming_examples' / 'basic' / 'vector_vector_add' / 'vector_vector_add.py'}"
+echo "[test] Running self-contained @iron.jit NPU kernel..."
+python3 "{jit_script}"
 """
         run(["bash", "-c", script], env=clean_env)
 
@@ -653,12 +665,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--venv", type=pathlib.Path, default=script_dir / ".ironenv", help="Target venv directory")
     parser.add_argument(
-        "--mlir-aie-dir",
-        type=pathlib.Path,
-        default=script_dir / "mlir-aie",
-        help="Xilinx/mlir-aie checkout directory",
-    )
-    parser.add_argument(
         "--channel",
         choices=("latest", "release"),
         default="latest",
@@ -679,7 +685,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     venv_dir = args.venv.resolve()
-    mlir_aie_dir = args.mlir_aie_dir.resolve()
 
     preflight = preflight_checks(test_only=args.test_only)
     if args.check_only:
@@ -688,13 +693,12 @@ def main() -> None:
 
     if not args.test_only:
         create_or_reuse_venv(venv_dir, preflight, recreate=args.recreate)
-        target_ref = sync_mlir_aie_repo(mlir_aie_dir, channel=args.channel)
-        install_python_toolchain(venv_dir, mlir_aie_dir, preflight, channel=args.channel, target_ref=target_ref)
+        install_python_toolchain(venv_dir, preflight, channel=args.channel)
         install_xrt_runtime(venv_dir, args.xrt_bundle)
         write_env_integration(venv_dir, preflight)
 
     if not args.skip_test:
-        run_npu_tests(venv_dir, mlir_aie_dir)
+        run_npu_tests(venv_dir)
 
     print(f'\nSetup complete! Activate in any shell with:\n  source "{venv_dir / "bin" / "activate"}"')
 

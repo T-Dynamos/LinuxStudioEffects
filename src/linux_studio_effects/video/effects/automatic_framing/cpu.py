@@ -14,6 +14,7 @@ from ...models.modnet import (
     get_modnet_config,
     load_from_hf,
 )
+from ...decoder import pyav_crop_resize_native
 from ...models.modnet.host_ops import resize_hwc_u8
 from ...models.video_depth_anything.host_ops import (
     crop_bilinear_resize_rgb_u8_fast,
@@ -394,6 +395,11 @@ class AutomaticFramingEffect(FrameEffect):
 
         if crop_w >= w and crop_h >= h:
             return np.ascontiguousarray(frame, dtype=np.uint8)
+
+        if crop_w <= w and crop_h <= h and w * h >= 128_000:
+            fast_pyav = pyav_crop_resize_native(frame, x0, y0, crop_w, crop_h, h, w, fmt)
+            if fast_pyav is not None:
+                return fast_pyav
 
         if yuv:
             fast_yuyv = crop_bilinear_resize_yuyv_u8_fast(frame, x0, y0, crop_w, crop_h, h, w, fmt)

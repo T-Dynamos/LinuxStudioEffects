@@ -197,87 +197,157 @@ class VideoPipeline:
             target_out_period = (1.0 / cfg.output_fps) if cfg.output_fps > 0 else 0.0
             next_out_deadline = wall_start
 
+            def _render_and_write(frame: Any, frame_idx: int) -> None:
+                nonlocal frames_out
+                if frame.data is None:
+                    return
+                frame_now = frame.capture_monotonic_s
+                t0 = time.perf_counter()
+                if self._effect is not None and self._effect.enabled:
+                    ctx = FrameContext(
+                        frame_index=frame_idx,
+                        timestamp_s=frame.driver_timestamp_s,
+                        width=frame.width,
+                        height=frame.height,
+                        fps=cam.negotiated.fps,
+                        pixel_format=output_format,
+                    )
+                    out_frame = self._effect.process(frame.data, ctx)
+                else:
+                    out_frame = frame.data
+                if out_frame.shape[0] != vcam.negotiated.height or (
+                    out_frame.shape[1] * 2 if is_yuv422(output_format) else out_frame.shape[1]
+                ) != vcam.negotiated.width:
+                    out_frame = resize_native(
+                        out_frame,
+                        vcam.negotiated.width,
+                        vcam.negotiated.height,
+                        output_format,
+                        mode=cfg.resize_mode,
+                    )
+                vcam.write_frame(out_frame)
+                end_now = time.perf_counter()
+                proc_ms_samples.append((end_now - t0) * 1000.0)
+                lag_ms_samples.append(max(0.0, (time.monotonic() - frame_now) * 1000.0))
+                frames_out += 1
+
+            def _maybe_report_stats(frame_now: float, cur_in: int, cur_drop: int) -> None:
+                nonlocal last_report_wall, last_report_cpu, last_report_in, last_report_out
+                if on_stats is None or stats_interval_s <= 0 or (frame_now - last_report_wall) < stats_interval_s:
+                    return
+                dt = max(frame_now - last_report_wall, 1e-9)
+                cpu_now = time.process_time()
+                d_cpu = max(cpu_now - last_report_cpu, 0.0)
+                on_stats(
+                    PipelineStats(
+                        input_config=cam.negotiated,
+                        output_config=vcam.negotiated,
+                        frames_in=cur_in - last_report_in,
+                        frames_out=frames_out - last_report_out,
+                        dropped_in=cur_drop,
+                        elapsed_s=dt,
+                        input_fps=(cur_in - last_report_in) / dt,
+                        output_fps=(frames_out - last_report_out) / dt,
+                        avg_process_ms=statistics.fmean(proc_ms_samples[-30:]) if proc_ms_samples else 0.0,
+                        cpu_percent=(d_cpu / dt) * 100.0,
+                        avg_lag_ms=statistics.fmean(lag_ms_samples[-30:]) if lag_ms_samples else 0.0,
+                    )
+                )
+                last_report_wall = frame_now
+                last_report_cpu = cpu_now
+                last_report_in = cur_in
+                last_report_out = frames_out
+
             try:
-                while not self._stop_event.is_set():
-                    now = time.monotonic()
-                    if duration_s is not None and (now - wall_start) >= duration_s:
-                        break
-                    if max_frames is not None and frames_out >= max_frames:
-                        break
+                if emit_every_frame and self._effect is not None:
+                    slot_cond = threading.Condition()
+                    latest_item: tuple[Any, int] | None = None
+                    reader_stop = threading.Event()
+                    reader_done = False
+                    capture_exc: BaseException | None = None
 
-                    # Emit every captured frame whenever target output_fps matches camera fps;
-                    # only downsample when explicitly outputting slower than camera rate.
-                    if emit_every_frame:
-                        should_emit = True
-                    else:
-                        est_arrival = max(now, last_frame_now + cam_period)
-                        should_emit = est_arrival >= next_out_deadline - 0.002
-                    frame = cam.read_frame(decode=should_emit, native=True, output_format=output_format)
-                    frames_in += 1
-                    dropped_in += frame.dropped_since_last
-                    frame_now = frame.capture_monotonic_s
-                    last_frame_now = frame_now
+                    def _capture_loop() -> None:
+                        nonlocal frames_in, dropped_in, latest_item, reader_done, capture_exc
+                        try:
+                            while not reader_stop.is_set() and not self._stop_event.is_set():
+                                if duration_s is not None and (time.monotonic() - wall_start) >= duration_s:
+                                    break
+                                fr = cam.read_frame(decode=True, native=True, output_format=output_format)
+                                with slot_cond:
+                                    frames_in += 1
+                                    dropped_in += fr.dropped_since_last
+                                    latest_item = (fr, frames_in)
+                                    slot_cond.notify()
+                        except BaseException as exc:  # pragma: no cover - surfaced on main thread
+                            capture_exc = exc
+                        finally:
+                            with slot_cond:
+                                reader_done = True
+                                slot_cond.notify_all()
 
-                    if should_emit and frame.data is not None:
-                        t0 = time.perf_counter()
-                        if self._effect is not None and self._effect.enabled:
-                            ctx = FrameContext(
-                                frame_index=frames_in,
-                                timestamp_s=frame.driver_timestamp_s,
-                                width=frame.width,
-                                height=frame.height,
-                                fps=cam.negotiated.fps,
-                                pixel_format=output_format,
-                            )
-                            out_frame = self._effect.process(frame.data, ctx)
+                    reader_thread = threading.Thread(target=_capture_loop, daemon=True, name="lse-capture-decode")
+                    reader_thread.start()
+                    try:
+                        while not self._stop_event.is_set():
+                            now = time.monotonic()
+                            if duration_s is not None and (now - wall_start) >= duration_s:
+                                break
+                            if max_frames is not None and frames_out >= max_frames:
+                                break
+                            with slot_cond:
+                                while latest_item is None and not reader_done and not self._stop_event.is_set() and not reader_stop.is_set():
+                                    slot_cond.wait(timeout=0.05)
+                                    if duration_s is not None and (time.monotonic() - wall_start) >= duration_s:
+                                        break
+                                item = latest_item
+                                latest_item = None
+                                cur_frames_in = frames_in
+                                cur_dropped_in = dropped_in
+                            if item is None:
+                                if reader_done or (duration_s is not None and (time.monotonic() - wall_start) >= duration_s):
+                                    break
+                                continue
+                            frame, frame_idx = item
+                            frame_now = frame.capture_monotonic_s
+                            last_frame_now = frame_now
+                            _render_and_write(frame, frame_idx)
+                            _maybe_report_stats(frame_now, cur_frames_in, cur_dropped_in)
+                    finally:
+                        reader_stop.set()
+                        with slot_cond:
+                            slot_cond.notify_all()
+                        reader_thread.join(timeout=2.0)
+                        if capture_exc is not None:
+                            raise capture_exc
+                else:
+                    while not self._stop_event.is_set():
+                        now = time.monotonic()
+                        if duration_s is not None and (now - wall_start) >= duration_s:
+                            break
+                        if max_frames is not None and frames_out >= max_frames:
+                            break
+
+                        # Emit every captured frame whenever target output_fps matches camera fps;
+                        # only downsample when explicitly outputting slower than camera rate.
+                        if emit_every_frame:
+                            should_emit = True
                         else:
-                            out_frame = frame.data
-                        if out_frame.shape[0] != vcam.negotiated.height or (
-                            out_frame.shape[1] * 2
-                            if is_yuv422(output_format)
-                            else out_frame.shape[1]
-                        ) != vcam.negotiated.width:
-                            out_frame = resize_native(
-                                out_frame,
-                                vcam.negotiated.width,
-                                vcam.negotiated.height,
-                                output_format,
-                                mode=cfg.resize_mode,
-                            )
-                        vcam.write_frame(out_frame)
-                        end_now = time.perf_counter()
-                        proc_ms_samples.append((end_now - t0) * 1000.0)
-                        lag_ms_samples.append(max(0.0, (time.monotonic() - frame_now) * 1000.0))
-                        frames_out += 1
+                            est_arrival = max(now, last_frame_now + cam_period)
+                            should_emit = est_arrival >= next_out_deadline - 0.002
+                        frame = cam.read_frame(decode=should_emit, native=True, output_format=output_format)
+                        frames_in += 1
+                        dropped_in += frame.dropped_since_last
+                        frame_now = frame.capture_monotonic_s
+                        last_frame_now = frame_now
 
-                        if not emit_every_frame and target_out_period > 0.0:
-                            next_out_deadline += target_out_period
-                            if next_out_deadline < frame_now:
-                                next_out_deadline = frame_now + target_out_period
+                        if should_emit and frame.data is not None:
+                            _render_and_write(frame, frames_in)
+                            if not emit_every_frame and target_out_period > 0.0:
+                                next_out_deadline += target_out_period
+                                if next_out_deadline < frame_now:
+                                    next_out_deadline = frame_now + target_out_period
 
-                    if on_stats is not None and stats_interval_s > 0 and (frame_now - last_report_wall) >= stats_interval_s:
-                        dt = max(frame_now - last_report_wall, 1e-9)
-                        cpu_now = time.process_time()
-                        d_cpu = max(cpu_now - last_report_cpu, 0.0)
-                        on_stats(
-                            PipelineStats(
-                                input_config=cam.negotiated,
-                                output_config=vcam.negotiated,
-                                frames_in=frames_in - last_report_in,
-                                frames_out=frames_out - last_report_out,
-                                dropped_in=dropped_in,
-                                elapsed_s=dt,
-                                input_fps=(frames_in - last_report_in) / dt,
-                                output_fps=(frames_out - last_report_out) / dt,
-                                avg_process_ms=statistics.fmean(proc_ms_samples[-30:]) if proc_ms_samples else 0.0,
-                                cpu_percent=(d_cpu / dt) * 100.0,
-                                avg_lag_ms=statistics.fmean(lag_ms_samples[-30:]) if lag_ms_samples else 0.0,
-                            )
-                        )
-                        last_report_wall = frame_now
-                        last_report_cpu = cpu_now
-                        last_report_in = frames_in
-                        last_report_out = frames_out
+                        _maybe_report_stats(frame_now, frames_in, dropped_in)
             except KeyboardInterrupt:
                 self._stop_event.set()
             finally:

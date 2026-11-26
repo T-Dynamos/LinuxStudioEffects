@@ -7,9 +7,23 @@ import time
 
 import numpy as np
 
-from ...pixels import model_luma_input
+from ...pixels import is_yuv422, model_luma_input
 from ..video_depth_anything.npu_ops import set_npu_worker_thread
+from .host_ops import extract_luma_low
 from .model import ModnetModel, SegmentationResult
+
+
+def _prepare_model_input(model: ModnetModel, raw_frame: np.ndarray, raw_fmt: str) -> np.ndarray:
+    """Prepare compact (th, tw, 3) model input directly from native YUYV/UYVY without 1080p repeat."""
+    if is_yuv422(raw_fmt):
+        h = int(raw_frame.shape[0])
+        w = int(raw_frame.shape[1] * 2)
+        th, tw = model.config.resolve_input_hw(h, w)
+        y_low = extract_luma_low(raw_frame, raw_fmt, th, tw)
+        if y_low is not None:
+            y_u8 = np.clip(np.round(y_low * np.float32(255.0)), 0, 255).astype(np.uint8)
+            return np.repeat(y_u8[:, :, None], 3, axis=2)
+    return model_luma_input(raw_frame, raw_fmt)
 
 
 class AsyncModnetWorker:
@@ -77,7 +91,7 @@ class AsyncModnetWorker:
                         continue
                     raw_frame, raw_fmt, src_idx, src_t = snap
                     t0 = time.perf_counter()
-                    model_input = model_luma_input(raw_frame, raw_fmt)
+                    model_input = _prepare_model_input(model, raw_frame, raw_fmt)
                     res = model.infer(model_input)
                     with self._lock:
                         self._latest_result = res
@@ -143,7 +157,7 @@ class AsyncModnetWorker:
                 self._busy = True
         if cur is None:
             frame_copy = frame.copy()
-            model_input = model_luma_input(frame_copy, pixel_format)
+            model_input = _prepare_model_input(model, frame_copy, pixel_format)
             res = model.infer(model_input)
             with self._lock:
                 self._latest_result = res

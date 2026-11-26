@@ -86,7 +86,7 @@ flowchart LR
 
 ### Prerequisites
 - Linux (`x86_64`) with kernel >= 6.14 (`amdxdna` driver exposing `/dev/accel/accel*` with read/write permissions)
-- Python 3.14 (or `uv`) and `git` for NPU setup; the standalone bundle includes XRT, `pyxrt`, and `xclbinutil`
+- Python 3.14 (or `uv`) for NPU setup; the standalone bundle includes XRT, `pyxrt`, and `xclbinutil`
 - No system `xrt` or `xrt-plugin-amdxdna` packages required
 - For rootless virtual camera creation (`v4l2loopback`) without `sudo`, either pre-load a loopback device or grant user ACL access once via udev (`KERNEL=="v4l2loopback", TAG+="uaccess"` and `SUBSYSTEM=="video4linux", KERNEL=="video*", DRIVERS=="v4l2loopback", TAG+="uaccess"`)
 

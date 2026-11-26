@@ -80,7 +80,15 @@ def pack_yuv422(y: np.ndarray, u: np.ndarray, v: np.ndarray, pixel_format: str) 
 
 def yuv422_to_channels(frame: np.ndarray, pixel_format: str) -> np.ndarray:
     """Expose Y, U, V planes at luma resolution for channel-wise spatial effects."""
-    y, u, v = split_yuv422(frame, pixel_format)
+    from .models.video_depth_anything.host_ops import yuv422_to_channels_u8_fast
+
+    fmt = pixel_format.upper()
+    if fmt not in PACKED_YUV422_FORMATS:
+        raise ValueError(f"Expected YUYV or UYVY, got {pixel_format!r}")
+    fast = yuv422_to_channels_u8_fast(frame, fmt)
+    if fast is not None:
+        return fast
+    y, u, v = split_yuv422(frame, fmt)
     return np.stack((y, np.repeat(u, 2, axis=1), np.repeat(v, 2, axis=1)), axis=2)
 
 
@@ -93,11 +101,20 @@ def channels_to_yuv422(frame: np.ndarray, pixel_format: str) -> np.ndarray:
     """Repack Y/U/V channels, averaging each horizontal chroma pair."""
     if frame.ndim != 3 or frame.shape[2] != 3:
         raise ValueError(f"Expected full-resolution YUV channels, got {frame.shape}")
+    from .models.video_depth_anything.host_ops import channels_to_yuv422_u8_fast
+
+    fmt = pixel_format.upper()
+    if fmt not in PACKED_YUV422_FORMATS:
+        raise ValueError(f"Expected YUYV or UYVY, got {pixel_format!r}")
+    if not (frame.shape[1] & 1):
+        fast = channels_to_yuv422_u8_fast(frame, fmt)
+        if fast is not None:
+            return fast
     return pack_yuv422(
         frame[:, :, 0],
         ((frame[:, 0::2, 1].astype(np.uint16) + frame[:, 1::2, 1]) // 2).astype(np.uint8),
         ((frame[:, 0::2, 2].astype(np.uint16) + frame[:, 1::2, 2]) // 2).astype(np.uint8),
-        pixel_format,
+        fmt,
     )
 
 

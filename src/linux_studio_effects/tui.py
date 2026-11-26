@@ -33,9 +33,11 @@ from .video import (
     available_effect_backends,
     create_effect,
     pick_default_camera,
+    pick_default_loopback,
     query_video_device,
 )
 from .video.pixels import NATIVE_PIXEL_FORMATS
+from .video.v4l2 import create_loopback_device
 
 
 def _parse_size(value: str) -> tuple[int, int]:
@@ -103,70 +105,86 @@ def _select_camera_mode(
     return best, chosen_fps
 
 
-def _run_privileged(command: list[str]) -> None:
-    cmd = command if os.geteuid() == 0 else ["sudo", *command]
-    try:
-        result = subprocess.run(cmd, check=False)
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Required command is missing: {cmd[0]}") from exc
-    if result.returncode:
-        raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(cmd)}")
+_ROOTLESS_V4L2_HELP = (
+    "Rootless virtual camera requires either a pre-created v4l2loopback device or user access to "
+    "`/dev/v4l2loopback`. One-time setup:\n"
+    "  sudo modprobe v4l2loopback\n"
+    "  echo 'KERNEL==\"v4l2loopback\", TAG+=\"uaccess\"' | sudo tee /etc/udev/rules.d/99-v4l2loopback.rules\n"
+    "  echo 'SUBSYSTEM==\"video4linux\", KERNEL==\"video*\", DRIVERS==\"v4l2loopback\", TAG+=\"uaccess\"' | sudo tee -a /etc/udev/rules.d/99-v4l2loopback.rules\n"
+    "  sudo udevadm control --reload-rules && sudo udevadm trigger /dev/v4l2loopback"
+)
 
 
 def _ensure_loopback_device(
     device: str,
     log_fn: Callable[[str], None] | None = None,
-) -> Callable[[], None] | None:
-    device_path = pathlib.Path(device)
+) -> tuple[str, Callable[[], None] | None]:
+    """Resolve an existing accessible loopback device or create one without sudo."""
 
-    def require_accessible() -> None:
-        if not os.access(device, os.R_OK | os.W_OK):
+    def require_accessible(path_str: str) -> None:
+        if not os.access(path_str, os.R_OK | os.W_OK):
             raise RuntimeError(
-                f"{device} exists but is not readable/writable; check device permissions/udev."
+                f"{path_str} exists but is not readable/writable; ensure udev/video permissions allow non-root access."
             )
 
-    if device_path.exists():
-        require_accessible()
-        return None
-
-    number = device_path.name.removeprefix("video")
-    if device_path.parent != pathlib.Path("/dev") or not device_path.name.startswith("video") or not number.isdigit():
-        raise RuntimeError(f"Cannot auto-create {device}: expected /dev/videoN")
-
-    if log_fn is not None:
-        log_fn(f"[yellow]Creating temporary v4l2loopback device {device}...[/]")
-    if pathlib.Path("/sys/module/v4l2loopback").exists():
-        ctl = shutil.which("v4l2loopback-ctl")
-        if not ctl:
-            raise RuntimeError("v4l2loopback is loaded but missing device; install v4l2loopback-ctl")
-        _run_privileged([ctl, "add", "--name", "LinuxStudioEffects", "--exclusive-caps", "1", device])
-        cleanup = lambda: _run_privileged([ctl, "delete", device])
+    if not device:
+        existing = pick_default_loopback()
+        if existing is not None:
+            return existing.path, None
+        video_nr = -1
+        target_hint = "auto-assigned /dev/videoN"
     else:
+        device_path = pathlib.Path(device)
+        if device_path.exists():
+            require_accessible(device)
+            return device, None
+        number = device_path.name.removeprefix("video")
+        if device_path.parent != pathlib.Path("/dev") or not device_path.name.startswith("video") or not number.isdigit():
+            raise RuntimeError(f"Cannot create {device}: expected /dev/videoN")
+        video_nr = int(number)
+        target_hint = device
+
+    ctrl_path = pathlib.Path("/dev/v4l2loopback")
+    cleanup: Callable[[], None] | None = None
+    created_path: str | None = None
+
+    if ctrl_path.exists() and os.access(ctrl_path, os.R_OK | os.W_OK):
+        if log_fn is not None:
+            log_fn(f"[yellow]Creating virtual camera ({target_hint}) without root...[/]")
+        created_path, cleanup = create_loopback_device(video_nr=video_nr, card_label="LinuxStudioEffects")
+    elif os.geteuid() == 0:
         modprobe = shutil.which("modprobe") or "/usr/bin/modprobe"
-        _run_privileged(
-            [modprobe, "v4l2loopback", f"video_nr={number}", "card_label=LinuxStudioEffects", "exclusive_caps=1"]
+        nr_args = [f"video_nr={video_nr}"] if video_nr >= 0 else []
+        res = subprocess.run(
+            [modprobe, "v4l2loopback", *nr_args, "card_label=LinuxStudioEffects", "exclusive_caps=1"],
+            check=False,
         )
-        cleanup = lambda: _run_privileged([modprobe, "-r", "v4l2loopback"])
+        if res.returncode != 0:
+            raise RuntimeError(f"modprobe v4l2loopback failed ({res.returncode})")
+        if video_nr >= 0:
+            created_path = f"/dev/video{video_nr}"
+        cleanup = lambda: subprocess.run([modprobe, "-r", "v4l2loopback"], check=False)
+    else:
+        raise RuntimeError(_ROOTLESS_V4L2_HELP)
 
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        if device_path.exists():
-            try:
-                uid = int(os.environ.get("SUDO_UID", os.getuid()))
-                gid = int(os.environ.get("SUDO_GID", os.getgid()))
-                _run_privileged(["chown", f"{uid}:{gid}", device])
-                _run_privileged(["chmod", "0600", device])
-                require_accessible()
-            except Exception:
-                cleanup()
-                raise
+        resolved = created_path or (existing.path if (existing := pick_default_loopback()) is not None else None)
+        if resolved and pathlib.Path(resolved).exists() and os.access(resolved, os.R_OK | os.W_OK):
             if log_fn is not None:
-                log_fn(f"[green]Created temporary v4l2loopback device {device}[/]")
-            return cleanup
+                log_fn(f"[green]Ready virtual camera {resolved}[/]")
+            return resolved, cleanup
         time.sleep(0.05)
 
-    cleanup()
-    raise RuntimeError(f"v4l2loopback setup finished, but {device} did not appear")
+    if cleanup is not None:
+        try:
+            cleanup()
+        except Exception:
+            pass
+    raise RuntimeError(
+        f"Loopback node created ({created_path or target_hint}) is not user-accessible without root. "
+        "Add a udev rule granting `TAG+=\"uaccess\"` on v4l2loopback video nodes."
+    )
 
 _EFFECT_CHOICES = (
     "portrait_blur",
@@ -552,7 +570,7 @@ class StudioEffectsApp(App[None]):
         mode, chosen_fps = picked
         out_fmt = self.args.pixel_format or ("YUYV" if mode.pixel_format == "MJPG" else mode.pixel_format)
         try:
-            cleanup = _ensure_loopback_device(
+            out_device, cleanup = _ensure_loopback_device(
                 self.args.output_device,
                 log_fn=lambda m: self.call_from_thread(self._log, m),
             )
@@ -566,7 +584,7 @@ class StudioEffectsApp(App[None]):
             input_width=mode.width,
             input_height=mode.height,
             input_format=mode.pixel_format,
-            output_device=self.args.output_device,
+            output_device=out_device,
             output_width=mode.width,
             output_height=mode.height,
             output_format=out_fmt,
@@ -578,7 +596,7 @@ class StudioEffectsApp(App[None]):
         self._stream_start_t = time.perf_counter()
         self.call_from_thread(
             self._log,
-            f"[cyan]Streaming[/] {camera_info.path} ({mode.width}x{mode.height} {mode.pixel_format} @ {chosen_fps:g}fps -> {out_fmt}) -> {self.args.output_device}",
+            f"[cyan]Streaming[/] {camera_info.path} ({mode.width}x{mode.height} {mode.pixel_format} @ {chosen_fps:g}fps -> {out_fmt}) -> {out_device}",
         )
         try:
             pipe.run(
@@ -729,7 +747,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--pixel-format", choices=NATIVE_PIXEL_FORMATS)
     parser.add_argument("--input-device", default="")
-    parser.add_argument("--output-device", default="/dev/video4")
+    parser.add_argument("--output-device", default="")
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--image")
     parser.add_argument("--frames", type=int, default=0)

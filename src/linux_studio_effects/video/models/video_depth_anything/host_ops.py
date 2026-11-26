@@ -414,6 +414,53 @@ def _load_c_lib() -> ctypes.CDLL | None:
     ]
     lib.unpremul_resize_hw4_to_rgb_u8_f32.restype = ctypes.c_int
 
+    lib.yuv422_to_channels_u8.argtypes = [
+        _C_U8_PTR,
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.yuv422_to_channels_u8.restype = None
+
+    lib.channels_to_yuv422_u8.argtypes = [
+        _C_U8_PTR,
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.channels_to_yuv422_u8.restype = None
+
+    lib.crop_bilinear_resize_rgb_u8.argtypes = [
+        _C_U8_PTR,
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.crop_bilinear_resize_rgb_u8.restype = ctypes.c_int
+
+    lib.crop_bilinear_resize_yuyv_u8.argtypes = [
+        _C_U8_PTR,
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.crop_bilinear_resize_yuyv_u8.restype = ctypes.c_int
+
     return lib
 
 
@@ -1164,6 +1211,89 @@ def bilinear_resize_hwc_u8_fast(arr: np.ndarray, out_h: int, out_w: int) -> np.n
     arr_c = np.ascontiguousarray(arr, dtype=np.float32)
     out = np.empty((out_h, out_w, 3), dtype=np.uint8)
     rc = _LIB.bilinear_resize_hwc_f32_to_u8(_ptr_f32(arr_c), _ptr_u8(out), in_h, in_w, out_h, out_w)
+    return out if rc == 0 else None
+
+
+def yuv422_to_channels_u8_fast(packed: np.ndarray, pixel_format: str) -> np.ndarray | None:
+    """Unpack (H, W//2, 4) YUYV/UYVY to uint8 (H, W, 3) [Y, U, V] in C, or None if unavailable."""
+    if _LIB is None:
+        return None
+    h, pair_w, c = packed.shape
+    if c != 4:
+        raise ValueError(f"Expected packed YUV422 shape (H, W//2, 4), got {packed.shape}")
+    src_c = np.ascontiguousarray(packed, dtype=np.uint8)
+    out = np.empty((h, pair_w * 2, 3), dtype=np.uint8)
+    _LIB.yuv422_to_channels_u8(_ptr_u8(src_c), _ptr_u8(out), h, pair_w, int(pixel_format.upper() == "UYVY"))
+    return out
+
+
+def channels_to_yuv422_u8_fast(ch: np.ndarray, pixel_format: str) -> np.ndarray | None:
+    """Repack uint8 (H, W, 3) [Y, U, V] to (H, W//2, 4) YUYV/UYVY in C, or None if unavailable."""
+    if _LIB is None:
+        return None
+    h, w, c = ch.shape
+    if c != 3 or (w & 1):
+        raise ValueError(f"Expected even-width (H, W, 3) channels, got {ch.shape}")
+    src_c = np.ascontiguousarray(ch, dtype=np.uint8)
+    out = np.empty((h, w // 2, 4), dtype=np.uint8)
+    _LIB.channels_to_yuv422_u8(_ptr_u8(src_c), _ptr_u8(out), h, w // 2, int(pixel_format.upper() == "UYVY"))
+    return out
+
+
+def crop_bilinear_resize_rgb_u8_fast(
+    src: np.ndarray,
+    x0: int,
+    y0: int,
+    crop_w: int,
+    crop_h: int,
+    out_h: int,
+    out_w: int,
+) -> np.ndarray | None:
+    """Crop & bilinearly resize uint8 (H, W, 3) -> (out_h, out_w, 3) directly in C, or None."""
+    if _LIB is None:
+        return None
+    in_h, in_w, c = src.shape
+    if c != 3:
+        raise ValueError(f"Expected (H, W, 3) array, got {src.shape}")
+    src_c = np.ascontiguousarray(src, dtype=np.uint8)
+    out = np.empty((out_h, out_w, 3), dtype=np.uint8)
+    rc = _LIB.crop_bilinear_resize_rgb_u8(
+        _ptr_u8(src_c), _ptr_u8(out), in_h, in_w, int(x0), int(y0), int(crop_w), int(crop_h), int(out_h), int(out_w)
+    )
+    return out if rc == 0 else None
+
+
+def crop_bilinear_resize_yuyv_u8_fast(
+    src: np.ndarray,
+    x0: int,
+    y0: int,
+    crop_w: int,
+    crop_h: int,
+    out_h: int,
+    out_w: int,
+    pixel_format: str,
+) -> np.ndarray | None:
+    """Crop & bilinearly resize packed YUYV/UYVY directly in C with no YUV444 intermediate."""
+    if _LIB is None:
+        return None
+    in_h, in_pair_w, c = src.shape
+    if c != 4 or (out_w & 1):
+        raise ValueError(f"Expected packed (H, W//2, 4) and even out_w, got {src.shape}, {out_w}")
+    src_c = np.ascontiguousarray(src, dtype=np.uint8)
+    out = np.empty((out_h, out_w // 2, 4), dtype=np.uint8)
+    rc = _LIB.crop_bilinear_resize_yuyv_u8(
+        _ptr_u8(src_c),
+        _ptr_u8(out),
+        in_h,
+        in_pair_w,
+        int(x0),
+        int(y0),
+        int(crop_w),
+        int(crop_h),
+        int(out_h),
+        out_w // 2,
+        int(pixel_format.upper() == "UYVY"),
+    )
     return out if rc == 0 else None
 
 

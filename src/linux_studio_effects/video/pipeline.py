@@ -190,6 +190,10 @@ class VideoPipeline:
             proc_ms_samples: list[float] = []
             lag_ms_samples: list[float] = []
 
+            cam_fps = cam.negotiated.fps if cam.negotiated.fps > 0 else cfg.input_fps
+            emit_every_frame = cfg.output_fps <= 0.0 or (cam_fps > 0.0 and cfg.output_fps >= cam_fps - 0.5)
+            cam_period = (1.0 / cam_fps) if cam_fps > 0.0 else 0.0
+            last_frame_now = wall_start
             target_out_period = (1.0 / cfg.output_fps) if cfg.output_fps > 0 else 0.0
             next_out_deadline = wall_start
 
@@ -201,12 +205,18 @@ class VideoPipeline:
                     if max_frames is not None and frames_out >= max_frames:
                         break
 
-                    # Determine whether this captured frame should be emitted to output.
-                    should_emit = target_out_period <= 0.0 or now >= next_out_deadline - 0.002
+                    # Emit every captured frame whenever target output_fps matches camera fps;
+                    # only downsample when explicitly outputting slower than camera rate.
+                    if emit_every_frame:
+                        should_emit = True
+                    else:
+                        est_arrival = max(now, last_frame_now + cam_period)
+                        should_emit = est_arrival >= next_out_deadline - 0.002
                     frame = cam.read_frame(decode=should_emit, native=True, output_format=output_format)
                     frames_in += 1
                     dropped_in += frame.dropped_since_last
                     frame_now = frame.capture_monotonic_s
+                    last_frame_now = frame_now
 
                     if should_emit and frame.data is not None:
                         t0 = time.perf_counter()
@@ -240,7 +250,7 @@ class VideoPipeline:
                         lag_ms_samples.append(max(0.0, (time.monotonic() - frame_now) * 1000.0))
                         frames_out += 1
 
-                        if target_out_period > 0.0:
+                        if not emit_every_frame and target_out_period > 0.0:
                             next_out_deadline += target_out_period
                             if next_out_deadline < frame_now:
                                 next_out_deadline = frame_now + target_out_period

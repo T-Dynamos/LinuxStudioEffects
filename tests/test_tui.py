@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import importlib.util
 import pathlib
 import subprocess
@@ -11,14 +12,16 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from linux_studio_effects.npu import probe_npu
-from linux_studio_effects.tui import LiveControllerEffect, StudioEffectsApp, _select_camera_mode
-from linux_studio_effects.video import FrameContext, VideoMode, create_effect
+from linux_studio_effects.tui import LiveControllerEffect, StudioEffectsApp, _ensure_loopback_device, _select_camera_mode
+from linux_studio_effects.video import FrameContext, VideoDeviceInfo, VideoMode, create_effect
+from linux_studio_effects.video.v4l2 import v4l2_loopback_config
 
 
 def _make_app_args(**overrides: object) -> argparse.Namespace:
@@ -107,6 +110,57 @@ class TuiTests(unittest.TestCase):
         self.assertIsNotNone(picked_raw)
         assert picked_raw is not None
         self.assertEqual(picked_raw[0].pixel_format, "YUYV")
+
+    def test_rootless_loopback_resolution_and_ioctl_config(self) -> None:
+        self.assertEqual(ctypes.sizeof(v4l2_loopback_config), 72)
+
+        existing = VideoDeviceInfo(
+            path="/dev/video9",
+            driver="v4l2 loopback",
+            card="LinuxStudioEffects",
+            bus_info="",
+            capabilities=0,
+            device_caps=0,
+            can_capture=False,
+            can_stream=True,
+            is_metadata_only=False,
+            rw_accessible=True,
+            modes=(),
+            can_output=True,
+        )
+        with mock.patch("linux_studio_effects.tui.pick_default_loopback", return_value=existing):
+            dev, cleanup = _ensure_loopback_device("")
+        self.assertEqual(dev, "/dev/video9")
+        self.assertIsNone(cleanup)
+
+        # When neither an existing loopback nor user-writable /dev/v4l2loopback exists,
+        # fail fast with instructions instead of invoking sudo inside the TUI.
+        with (
+            mock.patch("linux_studio_effects.tui.pick_default_loopback", return_value=None),
+            mock.patch("linux_studio_effects.tui.os.geteuid", return_value=1000),
+            mock.patch("linux_studio_effects.tui.os.access", return_value=False),
+            mock.patch("linux_studio_effects.tui.subprocess.run") as sub_run,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                _ensure_loopback_device("")
+            self.assertIn("Rootless virtual camera", str(ctx.exception))
+            sub_run.assert_not_called()
+
+        # When /dev/v4l2loopback is writable by the user, create without root or subprocesses.
+        fake_rm = mock.Mock()
+        with (
+            mock.patch("linux_studio_effects.tui.pick_default_loopback", return_value=None),
+            mock.patch("linux_studio_effects.tui.os.geteuid", return_value=1000),
+            mock.patch("linux_studio_effects.tui.pathlib.Path.exists", return_value=True),
+            mock.patch("linux_studio_effects.tui.os.access", return_value=True),
+            mock.patch("linux_studio_effects.tui.create_loopback_device", return_value=("/dev/video12", fake_rm)) as mk_lb,
+            mock.patch("linux_studio_effects.tui.subprocess.run") as sub_run,
+        ):
+            dev2, rm2 = _ensure_loopback_device("")
+        self.assertEqual(dev2, "/dev/video12")
+        self.assertIs(rm2, fake_rm)
+        mk_lb.assert_called_once()
+        sub_run.assert_not_called()
 
     def test_async_effect_lag_telemetry_tracks_frame_and_time_delay(self) -> None:
         frame = np.full((120, 160, 3), 120, dtype=np.uint8)

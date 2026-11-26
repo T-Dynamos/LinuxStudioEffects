@@ -20,16 +20,14 @@ def has_pyav() -> bool:
 
 def _frame_array(frame, target_format: str) -> np.ndarray:
     """Copy a PyAV frame plane into the public tightly packed ndarray layout."""
-    if target_format != "UYVY":
-        arr = frame.to_ndarray()
-        if target_format in {"YUYV", "UYVY"}:
-            return np.ascontiguousarray(arr).reshape(frame.height, frame.width // 2, 4)
-        return np.ascontiguousarray(arr).reshape(frame.height, frame.width, 3)
     plane = frame.planes[0]
-    row_bytes = frame.width * 2
-    data = bytes(plane)
-    rows = np.frombuffer(data, dtype=np.uint8).reshape(frame.height, plane.line_size)
-    return np.ascontiguousarray(rows[:, :row_bytes]).reshape(frame.height, frame.width // 2, 4)
+    bpp = 2 if target_format in {"YUYV", "UYVY"} else 3
+    row_bytes = frame.width * bpp
+    rows = np.frombuffer(plane, dtype=np.uint8).reshape(frame.height, plane.line_size)
+    packed = np.ascontiguousarray(rows[:, :row_bytes])
+    if target_format in {"YUYV", "UYVY"}:
+        return packed.reshape(frame.height, frame.width // 2, 4)
+    return packed.reshape(frame.height, frame.width, 3)
 
 
 def _native_to_av(source: np.ndarray, width: int, height: int, source_format: str, av):
@@ -55,6 +53,7 @@ class FrameDecoder:
     """Decode MJPEG packets and use FFmpeg/PyAV for frame reformatting."""
 
     def __init__(self, *, fast_dct: bool = True) -> None:
+        self._fast_dct = bool(fast_dct)
         self._codec = None
 
     def _av(self):
@@ -89,6 +88,12 @@ class FrameDecoder:
             av = self._av()
             if self._codec is None:
                 self._codec = av.CodecContext.create("mjpeg", "r")
+                self._codec.thread_count = 1
+                if self._fast_dct:
+                    if hasattr(av.codec.context, "Flags2") and hasattr(av.codec.context.Flags2, "fast"):
+                        self._codec.flags2 |= av.codec.context.Flags2.fast
+                    if hasattr(av.codec.context, "Flags") and hasattr(av.codec.context.Flags, "low_delay"):
+                        self._codec.flags |= av.codec.context.Flags.low_delay
             frames = self._codec.decode(av.Packet(bytes(raw)))
             if not frames:
                 raise ValueError("PyAV did not decode a frame from the MJPG packet")

@@ -372,6 +372,10 @@ def resize_hwc_u8(arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
         if arr.dtype == np.uint8:
             return np.ascontiguousarray(arr, dtype=np.uint8)
         return np.clip(np.round(arr), 0, 255).astype(np.uint8)
+    if arr.dtype == np.uint8:
+        fast_u8 = vda_host_ops.crop_bilinear_resize_rgb_u8_fast(arr, 0, 0, in_w, in_h, out_h, out_w)
+        if fast_u8 is not None:
+            return fast_u8
     arr_f32 = np.ascontiguousarray(arr, dtype=np.float32)
     fast = vda_host_ops.bilinear_resize_hwc_u8_fast(arr_f32, out_h, out_w)
     if fast is not None:

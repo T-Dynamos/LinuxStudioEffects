@@ -6,6 +6,7 @@ import ctypes
 import fcntl
 import glob
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # --- ioctl encoding (asm-generic/ioctl.h on Linux x86_64) ---
@@ -355,6 +356,22 @@ class v4l2_control(ctypes.Structure):
     ]
 
 
+class v4l2_loopback_config(ctypes.Structure):
+    _fields_ = [
+        ("output_nr", ctypes.c_int32),
+        ("unused", ctypes.c_int32),
+        ("card_label", ctypes.c_char * 32),
+        ("min_width", ctypes.c_uint32),
+        ("max_width", ctypes.c_uint32),
+        ("min_height", ctypes.c_uint32),
+        ("max_height", ctypes.c_uint32),
+        ("max_buffers", ctypes.c_int32),
+        ("max_openers", ctypes.c_int32),
+        ("debug", ctypes.c_int32),
+        ("announce_all_caps", ctypes.c_int32),
+    ]
+
+
 # --- ioctl numbers ---
 VIDIOC_QUERYCAP = _ior("V", 0, v4l2_capability)
 VIDIOC_ENUM_FMT = _iowr("V", 2, v4l2_fmtdesc)
@@ -369,9 +386,15 @@ VIDIOC_STREAMOFF = _iow("V", 19, ctypes.c_int)
 VIDIOC_G_PARM = _iowr("V", 21, v4l2_streamparm)
 VIDIOC_S_PARM = _iowr("V", 22, v4l2_streamparm)
 VIDIOC_G_CTRL = _iowr("V", 27, v4l2_control)
+VIDIOC_S_CTRL = _iowr("V", 28, v4l2_control)
 VIDIOC_QUERYCTRL = _iowr("V", 36, v4l2_queryctrl)
+
+V4L2_CID_EXPOSURE_AUTO_PRIORITY = 0x009A0903
 VIDIOC_ENUM_FRAMESIZES = _iowr("V", 74, v4l2_frmsizeenum)
 VIDIOC_ENUM_FRAMEINTERVALS = _iowr("V", 75, v4l2_frmivalenum)
+
+V4L2LOOPBACK_CTL_ADD = _iow("~", 1, v4l2_loopback_config)
+V4L2LOOPBACK_CTL_REMOVE = _iow("~", 2, ctypes.c_uint32)
 
 
 def xioctl(fd: int, request: int, arg: ctypes.Structure | ctypes._SimpleCData) -> None:
@@ -728,3 +751,41 @@ def pick_default_loopback(devices: list[VideoDeviceInfo] | None = None) -> Video
     """Select the first accessible v4l2loopback output device, if present."""
     loopbacks = list_loopback_devices(devices)
     return loopbacks[0] if loopbacks else None
+
+
+def remove_loopback_device(video_nr: int) -> None:
+    """Remove a dynamically created v4l2loopback node via `/dev/v4l2loopback`."""
+    fd = os.open("/dev/v4l2loopback", os.O_RDWR)
+    try:
+        arg = ctypes.c_uint32(int(video_nr))
+        fcntl.ioctl(fd, V4L2LOOPBACK_CTL_REMOVE, arg)
+    finally:
+        os.close(fd)
+
+
+def create_loopback_device(
+    *,
+    video_nr: int = -1,
+    card_label: str = "LinuxStudioEffects",
+    exclusive_caps: bool = True,
+) -> tuple[str, Callable[[], None]]:
+    """Create a virtual v4l2loopback device via `/dev/v4l2loopback` without external helpers."""
+    cfg = v4l2_loopback_config(
+        output_nr=int(video_nr),
+        unused=-1,
+        card_label=card_label.encode("utf-8")[:31],
+        min_width=0,
+        max_width=0,
+        min_height=0,
+        max_height=0,
+        max_buffers=2,
+        max_openers=4,
+        debug=0,
+        announce_all_caps=0 if exclusive_caps else 1,
+    )
+    fd = os.open("/dev/v4l2loopback", os.O_RDWR)
+    try:
+        assigned_nr = int(fcntl.ioctl(fd, V4L2LOOPBACK_CTL_ADD, cfg))
+    finally:
+        os.close(fd)
+    return f"/dev/video{assigned_nr}", (lambda: remove_loopback_device(assigned_nr))

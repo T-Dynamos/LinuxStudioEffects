@@ -17,6 +17,7 @@ from .v4l2 import (
     V4L2_CAP_DEVICE_CAPS,
     V4L2_CAP_STREAMING,
     V4L2_CAP_VIDEO_CAPTURE,
+    V4L2_CID_EXPOSURE_AUTO_PRIORITY,
     V4L2_FIELD_ANY,
     V4L2_MEMORY_MMAP,
     VIDIOC_DQBUF,
@@ -25,6 +26,7 @@ from .v4l2 import (
     VIDIOC_QUERYBUF,
     VIDIOC_QUERYCAP,
     VIDIOC_REQBUFS,
+    VIDIOC_S_CTRL,
     VIDIOC_S_FMT,
     VIDIOC_S_PARM,
     VIDIOC_STREAMOFF,
@@ -34,6 +36,7 @@ from .v4l2 import (
     str_to_fourcc,
     v4l2_buffer,
     v4l2_capability,
+    v4l2_control,
     v4l2_format,
     v4l2_requestbuffers,
     v4l2_streamparm,
@@ -200,6 +203,15 @@ class V4L2Camera:
             parm.parm.capture.timeperframe.denominator = max(1, int(round(target_fps * 1000)))
             try:
                 xioctl(fd, VIDIOC_S_PARM, parm)
+            except OSError:
+                pass
+        if target_fps >= 20.0:
+            # Prevent UVC dynamic exposure priority from silently halving sensor FPS in indoor light.
+            ctrl = v4l2_control()
+            ctrl.id = V4L2_CID_EXPOSURE_AUTO_PRIORITY
+            ctrl.value = 0
+            try:
+                xioctl(fd, VIDIOC_S_CTRL, ctrl)
             except OSError:
                 pass
 

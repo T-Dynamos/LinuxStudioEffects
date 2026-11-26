@@ -15,6 +15,10 @@ from ...models.modnet import (
     load_from_hf,
 )
 from ...models.modnet.host_ops import resize_hwc_u8
+from ...models.video_depth_anything.host_ops import (
+    crop_bilinear_resize_rgb_u8_fast,
+    crop_bilinear_resize_yuyv_u8_fast,
+)
 from ...pixels import NATIVE_PIXEL_FORMATS, channels_to_frame, frame_to_channels, is_yuv422
 from ..base import ComputeDevice, FrameContext, FrameEffect
 
@@ -126,7 +130,7 @@ class AutomaticFramingEffect(FrameEffect):
         min_subject_ratio: float = 0.015,
         lost_hold_frames: int = 30,
         async_tracking: bool = True,
-        track_interval_s: float = 0.05,
+        track_interval_s: float = 0.20,
         name: str | None = None,
         device: ComputeDevice | str = ComputeDevice.CPU,
         enabled: bool = True,
@@ -174,6 +178,9 @@ class AutomaticFramingEffect(FrameEffect):
         self.last_result: SegmentationResult | None = None
         self.last_box: tuple[float, float, float, float] | None = None
         self.last_crop: tuple[int, int, int, int] | None = None
+        self._cached_alpha_ref: np.ndarray | None = None
+        self._cached_alpha_key: tuple[object, ...] | None = None
+        self._cached_est: tuple[tuple[float, float, float], tuple[float, float, float, float]] | None = None
 
     def set_params(self, **params: object) -> AutomaticFramingEffect:
         """Validate and update live-tunable framing, zoom, and smoothing parameters."""
@@ -271,6 +278,9 @@ class AutomaticFramingEffect(FrameEffect):
         self._initialized_pose = False
         self.last_box = None
         self.last_crop = None
+        self._cached_alpha_ref = None
+        self._cached_alpha_key = None
+        self._cached_est = None
 
     @property
     def tracker_updates(self) -> int:
@@ -300,15 +310,31 @@ class AutomaticFramingEffect(FrameEffect):
 
     def update_framing_from_alpha(self, alpha: np.ndarray) -> tuple[float, float, float]:
         """Update smoothed normalized framing (cx, cy, zoom) from a predicted alpha matte."""
-        est = estimate_framing_target(
-            alpha,
-            min_zoom=self.min_zoom,
-            max_zoom=self.max_zoom,
-            zoom_bias=self.zoom_bias,
-            headroom=self.headroom,
-            side_margin=self.side_margin,
-            min_subject_ratio=self.min_subject_ratio,
+        key = (
+            id(alpha),
+            alpha.shape,
+            self.min_zoom,
+            self.max_zoom,
+            self.zoom_bias,
+            self.headroom,
+            self.side_margin,
+            self.min_subject_ratio,
         )
+        if self._cached_alpha_ref is alpha and self._cached_alpha_key == key:
+            est = self._cached_est
+        else:
+            est = estimate_framing_target(
+                alpha,
+                min_zoom=self.min_zoom,
+                max_zoom=self.max_zoom,
+                zoom_bias=self.zoom_bias,
+                headroom=self.headroom,
+                side_margin=self.side_margin,
+                min_subject_ratio=self.min_subject_ratio,
+            )
+            self._cached_alpha_ref = alpha
+            self._cached_alpha_key = key
+            self._cached_est = est
         if est is None:
             self._lost_frames += 1
             if self._lost_frames > self.lost_hold_frames:
@@ -354,8 +380,9 @@ class AutomaticFramingEffect(FrameEffect):
             raise ValueError(f"Unsupported pixel format {fmt!r}; expected one of {NATIVE_PIXEL_FORMATS}")
 
         cx, cy, zoom = self.update_framing_from_alpha(alpha)
-        channels = frame_to_channels(frame, fmt)
-        h, w = channels.shape[:2]
+        yuv = is_yuv422(fmt)
+        h = frame.shape[0]
+        w = frame.shape[1] * 2 if yuv else frame.shape[1]
 
         crop_w = max(4, min(w, int(round(w / zoom))))
         crop_h = max(4, min(h, int(round(h / zoom))))
@@ -368,6 +395,16 @@ class AutomaticFramingEffect(FrameEffect):
         if crop_w >= w and crop_h >= h:
             return np.ascontiguousarray(frame, dtype=np.uint8)
 
+        if yuv:
+            fast_yuyv = crop_bilinear_resize_yuyv_u8_fast(frame, x0, y0, crop_w, crop_h, h, w, fmt)
+            if fast_yuyv is not None:
+                return fast_yuyv
+        else:
+            fast_rgb = crop_bilinear_resize_rgb_u8_fast(frame, x0, y0, crop_w, crop_h, h, w)
+            if fast_rgb is not None:
+                return fast_rgb
+
+        channels = frame_to_channels(frame, fmt)
         cropped = channels[y0 : y0 + crop_h, x0 : x0 + crop_w]
         resized = resize_hwc_u8(cropped, h, w)
         return channels_to_frame(resized, fmt)

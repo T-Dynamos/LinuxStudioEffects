@@ -111,7 +111,7 @@ static int lse_resolve_thread_count(void) {
             return (int)req;
         }
     }
-    return (max_hw < 4) ? max_hw : 4;
+    return 1;
 }
 
 static void lse_pool_init(void) {
@@ -3817,5 +3817,326 @@ int unpremul_resize_hw4_to_rgb_u8_f32(
     }
     free(ibuf);
     free(fbuf);
+    return 0;
+}
+
+typedef struct {
+    const uint8_t *src;
+    uint8_t *dst;
+    int h;
+    int pair_w;
+    int is_uyvy;
+} yuv422_conv_ctx_t;
+
+static void yuv422_to_ch_worker(int64_t y_start, int64_t y_end, void *arg) {
+    const yuv422_conv_ctx_t *ctx = (const yuv422_conv_ctx_t *)arg;
+    const int pw = ctx->pair_w;
+    const size_t row_in_bytes = (size_t)pw * 4;
+    const size_t row_out_bytes = (size_t)pw * 6;
+    const int y0_off = ctx->is_uyvy ? 1 : 0;
+    const int u_off = ctx->is_uyvy ? 0 : 1;
+    const int y1_off = ctx->is_uyvy ? 3 : 2;
+    const int v_off = ctx->is_uyvy ? 2 : 3;
+
+    for (int64_t y = y_start; y < y_end; ++y) {
+        const uint8_t *in_row = ctx->src + (size_t)y * row_in_bytes;
+        uint8_t *out_row = ctx->dst + (size_t)y * row_out_bytes;
+        for (int p = 0; p < pw; ++p) {
+            const uint8_t *ip = in_row + (size_t)p * 4;
+            uint8_t *op = out_row + (size_t)p * 6;
+            const uint8_t u = ip[u_off];
+            const uint8_t v = ip[v_off];
+            op[0] = ip[y0_off];
+            op[1] = u;
+            op[2] = v;
+            op[3] = ip[y1_off];
+            op[4] = u;
+            op[5] = v;
+        }
+    }
+}
+
+void yuv422_to_channels_u8(const uint8_t *packed, uint8_t *out, int h, int pair_w, int is_uyvy) {
+    if (h <= 0 || pair_w <= 0) return;
+    yuv422_conv_ctx_t ctx = {packed, out, h, pair_w, is_uyvy};
+    if (h >= 16 && (int64_t)h * pair_w >= 8192) {
+        lse_parallel_for((int64_t)h, 16, yuv422_to_ch_worker, &ctx);
+    } else {
+        yuv422_to_ch_worker(0, (int64_t)h, &ctx);
+    }
+}
+
+static void ch_to_yuv422_worker(int64_t y_start, int64_t y_end, void *arg) {
+    const yuv422_conv_ctx_t *ctx = (const yuv422_conv_ctx_t *)arg;
+    const int pw = ctx->pair_w;
+    const size_t row_in_bytes = (size_t)pw * 6;
+    const size_t row_out_bytes = (size_t)pw * 4;
+    const int y0_off = ctx->is_uyvy ? 1 : 0;
+    const int u_off = ctx->is_uyvy ? 0 : 1;
+    const int y1_off = ctx->is_uyvy ? 3 : 2;
+    const int v_off = ctx->is_uyvy ? 2 : 3;
+
+    for (int64_t y = y_start; y < y_end; ++y) {
+        const uint8_t *in_row = ctx->src + (size_t)y * row_in_bytes;
+        uint8_t *out_row = ctx->dst + (size_t)y * row_out_bytes;
+        for (int p = 0; p < pw; ++p) {
+            const uint8_t *ip = in_row + (size_t)p * 6;
+            uint8_t *op = out_row + (size_t)p * 4;
+            op[y0_off] = ip[0];
+            op[u_off] = (uint8_t)(((unsigned)ip[1] + (unsigned)ip[4]) >> 1);
+            op[y1_off] = ip[3];
+            op[v_off] = (uint8_t)(((unsigned)ip[2] + (unsigned)ip[5]) >> 1);
+        }
+    }
+}
+
+void channels_to_yuv422_u8(const uint8_t *ch, uint8_t *out, int h, int pair_w, int is_uyvy) {
+    if (h <= 0 || pair_w <= 0) return;
+    yuv422_conv_ctx_t ctx = {ch, out, h, pair_w, is_uyvy};
+    if (h >= 16 && (int64_t)h * pair_w >= 8192) {
+        lse_parallel_for((int64_t)h, 16, ch_to_yuv422_worker, &ctx);
+    } else {
+        ch_to_yuv422_worker(0, (int64_t)h, &ctx);
+    }
+}
+
+static void _build_crop_lut_q8(
+    int origin,
+    int crop_len,
+    int max_idx,
+    int out_len,
+    int32_t *i0_out,
+    int32_t *i1_out,
+    int32_t *w_q8_out
+) {
+    if (crop_len <= 1 || out_len <= 1) {
+        int32_t c = (origin < 0) ? 0 : (origin > max_idx ? max_idx : origin);
+        for (int i = 0; i < out_len; ++i) {
+            i0_out[i] = c;
+            i1_out[i] = c;
+            w_q8_out[i] = 0;
+        }
+        return;
+    }
+    const double scale = (double)crop_len / (double)out_len;
+    const double hi = (double)(crop_len - 1);
+    for (int i = 0; i < out_len; ++i) {
+        double c = ((double)i + 0.5) * scale - 0.5;
+        if (c < 0.0) c = 0.0;
+        if (c > hi) c = hi;
+        int i0 = (int)floor(c);
+        int i1 = (i0 + 1 < crop_len) ? (i0 + 1) : (crop_len - 1);
+        int32_t wq = (int32_t)llround((c - (double)i0) * 256.0);
+        if (wq < 0) wq = 0;
+        if (wq > 256) wq = 256;
+        int32_t a0 = origin + i0;
+        int32_t a1 = origin + i1;
+        if (a0 < 0) a0 = 0; else if (a0 > max_idx) a0 = max_idx;
+        if (a1 < 0) a1 = 0; else if (a1 > max_idx) a1 = max_idx;
+        i0_out[i] = a0;
+        i1_out[i] = a1;
+        w_q8_out[i] = wq;
+    }
+}
+
+typedef struct {
+    const uint8_t *src;
+    uint8_t *dst;
+    int in_stride;
+    int out_h;
+    int out_w;
+    const int32_t *x0;
+    const int32_t *x1;
+    const int32_t *wx;
+    const int32_t *y0;
+    const int32_t *y1;
+    const int32_t *wy;
+} crop_resize_rgb_ctx_t;
+
+static void crop_resize_rgb_worker(int64_t oy_start, int64_t oy_end, void *arg) {
+    const crop_resize_rgb_ctx_t *ctx = (const crop_resize_rgb_ctx_t *)arg;
+    const int ow = ctx->out_w;
+    for (int64_t oy = oy_start; oy < oy_end; ++oy) {
+        const uint8_t *r0 = ctx->src + (size_t)ctx->y0[oy] * (size_t)ctx->in_stride;
+        const uint8_t *r1 = ctx->src + (size_t)ctx->y1[oy] * (size_t)ctx->in_stride;
+        uint8_t *out_row = ctx->dst + (size_t)oy * (size_t)ow * 3;
+        const int32_t wy1 = ctx->wy[oy];
+        const int32_t wy0 = 256 - wy1;
+
+        for (int ox = 0; ox < ow; ++ox) {
+            const int32_t ix0 = ctx->x0[ox] * 3;
+            const int32_t ix1 = ctx->x1[ox] * 3;
+            const int32_t wx1 = ctx->wx[ox];
+            const int32_t wx0 = 256 - wx1;
+            const uint8_t *p00 = r0 + ix0;
+            const uint8_t *p01 = r0 + ix1;
+            const uint8_t *p10 = r1 + ix0;
+            const uint8_t *p11 = r1 + ix1;
+            uint8_t *dp = out_row + (size_t)ox * 3;
+            for (int c = 0; c < 3; ++c) {
+                const int32_t top = (int32_t)p00[c] * wx0 + (int32_t)p01[c] * wx1;
+                const int32_t bot = (int32_t)p10[c] * wx0 + (int32_t)p11[c] * wx1;
+                const int32_t val = (top * wy0 + bot * wy1 + 32768) >> 16;
+                dp[c] = (uint8_t)(val < 0 ? 0 : (val > 255 ? 255 : val));
+            }
+        }
+    }
+}
+
+int crop_bilinear_resize_rgb_u8(
+    const uint8_t *src,
+    uint8_t *dst,
+    int in_h,
+    int in_w,
+    int x0,
+    int y0,
+    int crop_w,
+    int crop_h,
+    int out_h,
+    int out_w
+) {
+    if (in_h <= 0 || in_w <= 0 || crop_w <= 0 || crop_h <= 0 || out_h <= 0 || out_w <= 0) {
+        return -1;
+    }
+    int32_t *lut = (int32_t *)malloc(((size_t)out_w * 3 + (size_t)out_h * 3) * sizeof(int32_t));
+    if (!lut) return -1;
+    int32_t *lx0 = lut;
+    int32_t *lx1 = lx0 + out_w;
+    int32_t *lwx = lx1 + out_w;
+    int32_t *ly0 = lwx + out_w;
+    int32_t *ly1 = ly0 + out_h;
+    int32_t *lwy = ly1 + out_h;
+
+    _build_crop_lut_q8(x0, crop_w, in_w - 1, out_w, lx0, lx1, lwx);
+    _build_crop_lut_q8(y0, crop_h, in_h - 1, out_h, ly0, ly1, lwy);
+
+    crop_resize_rgb_ctx_t ctx = {src, dst, in_w * 3, out_h, out_w, lx0, lx1, lwx, ly0, ly1, lwy};
+    if (out_h >= 16 && (int64_t)out_h * out_w >= 8192) {
+        lse_parallel_for((int64_t)out_h, 16, crop_resize_rgb_worker, &ctx);
+    } else {
+        crop_resize_rgb_worker(0, (int64_t)out_h, &ctx);
+    }
+    free(lut);
+    return 0;
+}
+
+typedef struct {
+    const uint8_t *src;
+    uint8_t *dst;
+    int in_stride;
+    int out_h;
+    int out_pair_w;
+    int is_uyvy;
+    const int32_t *x0;
+    const int32_t *x1;
+    const int32_t *wx;
+    const int32_t *cx0;
+    const int32_t *cx1;
+    const int32_t *cwx;
+    const int32_t *y0;
+    const int32_t *y1;
+    const int32_t *wy;
+} crop_resize_yuyv_ctx_t;
+
+static void crop_resize_yuyv_worker(int64_t oy_start, int64_t oy_end, void *arg) {
+    const crop_resize_yuyv_ctx_t *ctx = (const crop_resize_yuyv_ctx_t *)arg;
+    const int opw = ctx->out_pair_w;
+    const int y0_off = ctx->is_uyvy ? 1 : 0;
+    const int u_off = ctx->is_uyvy ? 0 : 1;
+    const int y1_off = ctx->is_uyvy ? 3 : 2;
+    const int v_off = ctx->is_uyvy ? 2 : 3;
+    const int lum_base = ctx->is_uyvy ? 1 : 0;
+
+    for (int64_t oy = oy_start; oy < oy_end; ++oy) {
+        const uint8_t *r0 = ctx->src + (size_t)ctx->y0[oy] * (size_t)ctx->in_stride;
+        const uint8_t *r1 = ctx->src + (size_t)ctx->y1[oy] * (size_t)ctx->in_stride;
+        uint8_t *out_row = ctx->dst + (size_t)oy * (size_t)opw * 4;
+        const int32_t wy1 = ctx->wy[oy];
+        const int32_t wy0 = 256 - wy1;
+
+        for (int p = 0; p < opw; ++p) {
+            const int ox0 = 2 * p;
+            const int ox1 = ox0 + 1;
+
+            const int32_t l_ix0 = (ctx->x0[ox0] >> 1) * 4 + (ctx->x0[ox0] & 1) * 2 + lum_base;
+            const int32_t l_ix1 = (ctx->x1[ox0] >> 1) * 4 + (ctx->x1[ox0] & 1) * 2 + lum_base;
+            const int32_t l_wx1 = ctx->wx[ox0];
+            const int32_t l_wx0 = 256 - l_wx1;
+            const int32_t yl_top = (int32_t)r0[l_ix0] * l_wx0 + (int32_t)r0[l_ix1] * l_wx1;
+            const int32_t yl_bot = (int32_t)r1[l_ix0] * l_wx0 + (int32_t)r1[l_ix1] * l_wx1;
+            const int32_t yl = (yl_top * wy0 + yl_bot * wy1 + 32768) >> 16;
+
+            const int32_t r_ix0 = (ctx->x0[ox1] >> 1) * 4 + (ctx->x0[ox1] & 1) * 2 + lum_base;
+            const int32_t r_ix1 = (ctx->x1[ox1] >> 1) * 4 + (ctx->x1[ox1] & 1) * 2 + lum_base;
+            const int32_t r_wx1 = ctx->wx[ox1];
+            const int32_t r_wx0 = 256 - r_wx1;
+            const int32_t yr_top = (int32_t)r0[r_ix0] * r_wx0 + (int32_t)r0[r_ix1] * r_wx1;
+            const int32_t yr_bot = (int32_t)r1[r_ix0] * r_wx0 + (int32_t)r1[r_ix1] * r_wx1;
+            const int32_t yr = (yr_top * wy0 + yr_bot * wy1 + 32768) >> 16;
+
+            const int32_t cp0 = ctx->cx0[p] * 4;
+            const int32_t cp1 = ctx->cx1[p] * 4;
+            const int32_t cwx1 = ctx->cwx[p];
+            const int32_t cwx0 = 256 - cwx1;
+            const int32_t u_top = (int32_t)r0[cp0 + u_off] * cwx0 + (int32_t)r0[cp1 + u_off] * cwx1;
+            const int32_t u_bot = (int32_t)r1[cp0 + u_off] * cwx0 + (int32_t)r1[cp1 + u_off] * cwx1;
+            const int32_t u_val = (u_top * wy0 + u_bot * wy1 + 32768) >> 16;
+
+            const int32_t v_top = (int32_t)r0[cp0 + v_off] * cwx0 + (int32_t)r0[cp1 + v_off] * cwx1;
+            const int32_t v_bot = (int32_t)r1[cp0 + v_off] * cwx0 + (int32_t)r1[cp1 + v_off] * cwx1;
+            const int32_t v_val = (v_top * wy0 + v_bot * wy1 + 32768) >> 16;
+
+            uint8_t *op = out_row + (size_t)p * 4;
+            op[y0_off] = (uint8_t)(yl < 0 ? 0 : (yl > 255 ? 255 : yl));
+            op[u_off] = (uint8_t)(u_val < 0 ? 0 : (u_val > 255 ? 255 : u_val));
+            op[y1_off] = (uint8_t)(yr < 0 ? 0 : (yr > 255 ? 255 : yr));
+            op[v_off] = (uint8_t)(v_val < 0 ? 0 : (v_val > 255 ? 255 : v_val));
+        }
+    }
+}
+
+int crop_bilinear_resize_yuyv_u8(
+    const uint8_t *src,
+    uint8_t *dst,
+    int in_h,
+    int in_pair_w,
+    int x0,
+    int y0,
+    int crop_w,
+    int crop_h,
+    int out_h,
+    int out_pair_w,
+    int is_uyvy
+) {
+    if (in_h <= 0 || in_pair_w <= 0 || crop_w <= 0 || crop_h <= 0 || out_h <= 0 || out_pair_w <= 0) {
+        return -1;
+    }
+    const int in_w = in_pair_w * 2;
+    const int out_w = out_pair_w * 2;
+    int32_t *lut = (int32_t *)malloc(((size_t)out_w * 3 + (size_t)out_pair_w * 3 + (size_t)out_h * 3) * sizeof(int32_t));
+    if (!lut) return -1;
+    int32_t *lx0 = lut;
+    int32_t *lx1 = lx0 + out_w;
+    int32_t *lwx = lx1 + out_w;
+    int32_t *cx0 = lwx + out_w;
+    int32_t *cx1 = cx0 + out_pair_w;
+    int32_t *cwx = cx1 + out_pair_w;
+    int32_t *ly0 = cwx + out_pair_w;
+    int32_t *ly1 = ly0 + out_h;
+    int32_t *lwy = ly1 + out_h;
+
+    _build_crop_lut_q8(x0, crop_w, in_w - 1, out_w, lx0, lx1, lwx);
+    _build_crop_lut_q8(x0 / 2, (crop_w + 1) / 2, in_pair_w - 1, out_pair_w, cx0, cx1, cwx);
+    _build_crop_lut_q8(y0, crop_h, in_h - 1, out_h, ly0, ly1, lwy);
+
+    crop_resize_yuyv_ctx_t ctx = {
+        src, dst, in_pair_w * 4, out_h, out_pair_w, is_uyvy, lx0, lx1, lwx, cx0, cx1, cwx, ly0, ly1, lwy
+    };
+    if (out_h >= 16 && (int64_t)out_h * out_pair_w >= 4096) {
+        lse_parallel_for((int64_t)out_h, 16, crop_resize_yuyv_worker, &ctx);
+    } else {
+        crop_resize_yuyv_worker(0, (int64_t)out_h, &ctx);
+    }
+    free(lut);
     return 0;
 }

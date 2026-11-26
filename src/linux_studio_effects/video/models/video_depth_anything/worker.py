@@ -25,6 +25,7 @@ class AsyncDepthWorker:
         self._seen_frames: int = 0
         self._result_frame_idx: int = 0
         self._result_capture_t: float | None = None
+        self._busy: bool = False
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -71,6 +72,7 @@ class AsyncDepthWorker:
                     self._ready_event.clear()
                     with self._lock:
                         snap = self._latest_frame
+                        self._latest_frame = None
                     if snap is None:
                         continue
                     raw_frame, raw_fmt, src_idx, src_t = snap
@@ -82,8 +84,12 @@ class AsyncDepthWorker:
                         self._result_capture_t = src_t
                         self._updates += 1
                     rem = self.interval_s - (time.perf_counter() - t0)
+                    if self.interval_s > 0.0:
+                        rem = max(rem, min(self.interval_s * 0.25, 0.03))
                     if rem > 0.0:
                         self._stop_event.wait(rem)
+                    with self._lock:
+                        self._busy = False
             finally:
                 npu_ops.set_npu_worker_thread(False)
 
@@ -103,6 +109,7 @@ class AsyncDepthWorker:
             self._seen_frames = 0
             self._result_frame_idx = 0
             self._result_capture_t = None
+            self._busy = False
 
     def step(
         self,
@@ -124,13 +131,15 @@ class AsyncDepthWorker:
                 self._updates += 1
             return res
 
-        frame_copy = frame.copy()
         with self._lock:
             self._seen_frames += 1
             cur_idx = self._seen_frames
             cur = self._latest_result
-            self._latest_frame = (frame_copy, pixel_format, cur_idx, now)
+            should_capture = (cur is None) or (not self._busy)
+            if should_capture and cur is not None:
+                self._busy = True
         if cur is None:
+            frame_copy = frame.copy()
             res = model.infer(model_luma_input(frame_copy, pixel_format))
             with self._lock:
                 self._latest_result = res
@@ -139,5 +148,9 @@ class AsyncDepthWorker:
                 self._updates += 1
             self.start(model)
             return res
-        self._ready_event.set()
+        if should_capture:
+            frame_copy = frame.copy()
+            with self._lock:
+                self._latest_frame = (frame_copy, pixel_format, cur_idx, now)
+            self._ready_event.set()
         return cur

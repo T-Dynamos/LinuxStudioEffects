@@ -22,6 +22,7 @@ _COMPILE_FLAGS = [
     "-mavx512bw",
     "-mavx512vl",
     "-mfma",
+    "-pthread",
     "-shared",
     "-fPIC",
 ]
@@ -69,7 +70,7 @@ def _load_c_lib() -> ctypes.CDLL | None:
     except OSError:
         return None
 
-    src_hash = hashlib.sha256(src_bytes).hexdigest()[:16]
+    src_hash = hashlib.sha256(src_bytes + " ".join(_COMPILE_FLAGS).encode("utf-8")).hexdigest()[:16]
     cache_dir = _get_cache_dir()
     so_path = cache_dir / f"_host_ops_{src_hash}.so"
 
@@ -221,6 +222,18 @@ def _load_c_lib() -> ctypes.CDLL | None:
     ]
     lib.f32_unpad_bias_gelu.restype = None
 
+    lib.bf16_unpad_bias_gelu.argtypes = [
+        _C_U16_PTR,
+        ctypes.c_int64,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int,
+    ]
+    lib.bf16_unpad_bias_gelu.restype = None
+
     lib.f32_transpose_to_bf16_pad.argtypes = [
         _C_FLOAT_PTR,
         ctypes.c_int64,
@@ -245,6 +258,17 @@ def _load_c_lib() -> ctypes.CDLL | None:
     ]
     lib.f32_unpad_transpose_bias_relu.restype = None
 
+    lib.bf16_unpad_transpose_bias_relu.argtypes = [
+        _C_U16_PTR,
+        ctypes.c_int64,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int,
+    ]
+    lib.bf16_unpad_transpose_bias_relu.restype = None
+
     lib.temporal_attn_roll_f32.argtypes = [
         _C_FLOAT_PTR,
         _C_FLOAT_PTR,
@@ -263,6 +287,25 @@ def _load_c_lib() -> ctypes.CDLL | None:
     ]
     lib.temporal_attn_roll_f32.restype = None
 
+    lib.temporal_attn_roll_ring_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_float,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.temporal_attn_roll_ring_f32.restype = None
+
     lib.im2col_3x3_s1_p1_kykxc_bf16_pad.argtypes = [
         _C_FLOAT_PTR,
         _C_U16_PTR,
@@ -275,6 +318,101 @@ def _load_c_lib() -> ctypes.CDLL | None:
         ctypes.c_int,
     ]
     lib.im2col_3x3_s1_p1_kykxc_bf16_pad.restype = ctypes.c_int
+
+    lib.gaussian5_hw4_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.gaussian5_hw4_f32.restype = ctypes.c_int
+
+    lib.downsample2x_hw4_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.downsample2x_hw4_f32.restype = None
+
+    lib.box_filter_2d_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.box_filter_2d_f32.restype = ctypes.c_int
+
+    lib.extract_luma_and_downsample_f32.argtypes = [
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+    ]
+    lib.extract_luma_and_downsample_f32.restype = ctypes.c_int
+
+    lib.guided_upsample_coc_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+    lib.guided_upsample_coc_f32.restype = ctypes.c_int
+
+    lib.preprocess_rgb_u8_to_nchw_f32.argtypes = [
+        _C_U8_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.preprocess_rgb_u8_to_nchw_f32.restype = ctypes.c_int
+
+    lib.fused_mha_qkv_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_float,
+    ]
+    lib.fused_mha_qkv_f32.restype = ctypes.c_int
+
+    lib.pack_bokeh_npu_inputs_soa32_u8.argtypes = [
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        _C_U8_PTR,
+        ctypes.c_int64,
+        ctypes.c_int64,
+    ]
+    lib.pack_bokeh_npu_inputs_soa32_u8.restype = ctypes.c_int
+
+    lib.unpremul_resize_hw4_to_rgb_u8_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.unpremul_resize_hw4_to_rgb_u8_f32.restype = ctypes.c_int
 
     return lib
 
@@ -420,6 +558,46 @@ def f32_unpad_bias_gelu(
         gelu_inplace(dst_f32[:rows, :cols])
 
 
+def bf16_unpad_bias_gelu(
+    src_u16: np.ndarray,
+    dst_f32: np.ndarray,
+    rows: int,
+    cols: int,
+    *,
+    bias: np.ndarray | None = None,
+    apply_gelu: bool = False,
+) -> None:
+    """Convert bfloat16 uint16 [:rows, :cols] from padded NPU output to float32 with optional bias add and GELU."""
+    src = src_u16.view(np.uint16) if src_u16.dtype != np.uint16 else src_u16
+    if (
+        _LIB is not None
+        and dst_f32.flags["WRITEABLE"]
+        and src.strides[1] == 2
+        and src.strides[0] % 2 == 0
+        and dst_f32.strides[1] == 4
+        and dst_f32.strides[0] % 4 == 0
+    ):
+        b_c = np.ascontiguousarray(bias, dtype=np.float32) if bias is not None else None
+        _LIB.bf16_unpad_bias_gelu(
+            _ptr_u16(src),
+            src.strides[0] // 2,
+            _ptr_f32(dst_f32),
+            dst_f32.strides[0] // 4,
+            _ptr_f32(b_c) if b_c is not None else ctypes.cast(0, _C_FLOAT_PTR),
+            rows,
+            cols,
+            1 if apply_gelu else 0,
+        )
+        return
+
+    sub = (src[:rows, :cols].astype(np.uint32) << np.uint32(16)).view(np.float32)
+    if bias is not None:
+        sub = sub + bias[:cols]
+    dst_f32[:rows, :cols] = sub
+    if apply_gelu:
+        gelu_inplace(dst_f32[:rows, :cols])
+
+
 def f32_transpose_to_bf16_pad(
     src_f32: np.ndarray,
     dst_u16: np.ndarray,
@@ -491,6 +669,41 @@ def f32_unpad_transpose_bias_relu(
         return
 
     sub = src_f32[:m_hw, :c_out]
+    if bias is not None:
+        sub = sub + bias[:c_out]
+    if apply_relu:
+        sub = np.maximum(sub, np.float32(0.0))
+    np.copyto(dst_c_hw.reshape(c_out, m_hw), sub.T)
+
+
+def bf16_unpad_transpose_bias_relu(
+    src_u16: np.ndarray,
+    dst_c_hw: np.ndarray,
+    m_hw: int,
+    c_out: int,
+    *,
+    bias: np.ndarray | None = None,
+    apply_relu: bool = False,
+) -> None:
+    """Convert and transpose (M, C_out) bfloat16 uint16 NPU output into contiguous (C_out, M) float32."""
+    src = src_u16.view(np.uint16) if src_u16.dtype != np.uint16 else src_u16
+    if dst_c_hw.dtype != np.float32 or not dst_c_hw.flags["C_CONTIGUOUS"] or dst_c_hw.size != c_out * m_hw:
+        raise ValueError("dst_c_hw must be C-contiguous float32 matching (c_out, m_hw)")
+
+    if _LIB is not None and dst_c_hw.flags["WRITEABLE"] and src.strides[1] == 2 and src.strides[0] % 2 == 0:
+        b_c = np.ascontiguousarray(bias, dtype=np.float32) if bias is not None else None
+        _LIB.bf16_unpad_transpose_bias_relu(
+            _ptr_u16(src),
+            src.strides[0] // 2,
+            _ptr_f32(dst_c_hw),
+            _ptr_f32(b_c) if b_c is not None else ctypes.cast(0, _C_FLOAT_PTR),
+            m_hw,
+            c_out,
+            1 if apply_relu else 0,
+        )
+        return
+
+    sub = (src[:m_hw, :c_out].astype(np.uint32) << np.uint32(16)).view(np.float32)
     if bias is not None:
         sub = sub + bias[:c_out]
     if apply_relu:
@@ -606,6 +819,86 @@ def temporal_attn_roll(
         k_buf[:, t_len - 2, :] = k_cur
         v_buf[:, 2 : t_len - 2, :] = v_buf[:, 3 : t_len - 1, :]
         v_buf[:, t_len - 2, :] = v_cur
+    return out
+
+
+def temporal_attn_roll_ring(
+    q: np.ndarray,
+    k_cur: np.ndarray,
+    v_cur: np.ndarray,
+    k_buf: np.ndarray,
+    v_buf: np.ndarray,
+    k_pe: np.ndarray,
+    v_pe: np.ndarray,
+    n_heads: int,
+    scale: float,
+    has_history: bool,
+    cursor: int = 2,
+) -> np.ndarray:
+    """Zero-copy ring-buffer rolling-window temporal multi-head self-attention for (d, ch) inputs."""
+    d, ch = k_cur.shape
+    t_len = k_buf.shape[1]
+    dh = ch // n_heads
+
+    if (
+        _LIB is not None
+        and q.flags["C_CONTIGUOUS"]
+        and k_cur.flags["C_CONTIGUOUS"]
+        and v_cur.flags["C_CONTIGUOUS"]
+        and k_buf.flags["C_CONTIGUOUS"]
+        and v_buf.flags["C_CONTIGUOUS"]
+        and k_pe.flags["C_CONTIGUOUS"]
+        and v_pe.flags["C_CONTIGUOUS"]
+    ):
+        out = np.empty((d, ch), dtype=np.float32)
+        _LIB.temporal_attn_roll_ring_f32(
+            _ptr_f32(q),
+            _ptr_f32(k_cur),
+            _ptr_f32(v_cur),
+            _ptr_f32(k_buf),
+            _ptr_f32(v_buf),
+            _ptr_f32(k_pe),
+            _ptr_f32(v_pe),
+            _ptr_f32(out),
+            d,
+            t_len,
+            n_heads,
+            dh,
+            float(scale),
+            1 if has_history else 0,
+            int(cursor),
+        )
+        return out
+
+    if not has_history:
+        k_buf[:, : t_len - 1, :] = k_cur[:, None, :]
+        v_buf[:, : t_len - 1, :] = v_cur[:, None, :]
+        return (v_cur + v_pe[0]).astype(np.float32, copy=False)
+
+    k = np.empty((d, t_len, ch), dtype=np.float32)
+    v = np.empty((d, t_len, ch), dtype=np.float32)
+    if t_len >= 4:
+        ring = t_len - 3
+        base_off = (cursor - 2) % ring
+        idx = [0, 1] + [2 + (base_off + i) % ring for i in range(ring)]
+        k[:, : t_len - 1, :] = k_buf[:, idx, :] + k_pe[None, : t_len - 1, :]
+        v[:, : t_len - 1, :] = v_buf[:, idx, :] + v_pe[None, : t_len - 1, :]
+    else:
+        base_off = 0
+        k[:, : t_len - 1, :] = k_buf[:, : t_len - 1, :] + k_pe[None, : t_len - 1, :]
+        v[:, : t_len - 1, :] = v_buf[:, : t_len - 1, :] + v_pe[None, : t_len - 1, :]
+
+    k[:, t_len - 1, :] = k_cur + k_pe[t_len - 1]
+    v[:, t_len - 1, :] = v_cur + v_pe[t_len - 1]
+    qh = q.reshape(d, n_heads, 1, dh)
+    kh = k.reshape(d, t_len, n_heads, dh).transpose(0, 2, 3, 1)
+    vh = v.reshape(d, t_len, n_heads, dh).transpose(0, 2, 1, 3)
+    attn = softmax_rows(np.matmul(qh, kh) * np.float32(scale))
+    out = np.ascontiguousarray(np.matmul(attn, vh).reshape(d, ch), dtype=np.float32)
+    if t_len >= 4:
+        write_slot = 2 + base_off
+        k_buf[:, write_slot, :] = k_cur
+        v_buf[:, write_slot, :] = v_cur
     return out
 
 
@@ -915,3 +1208,365 @@ def bokeh_composite_u8(
     acc += 128
     acc >>= 8
     return np.ascontiguousarray(acc.astype(np.uint8))
+
+
+def gaussian5_hw4(arr: np.ndarray, passes: int = 1) -> np.ndarray:
+    """Separable 5-tap [1,4,6,4,1]/16 Gaussian blur on (H, W, 4) float32 with edge clamping."""
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise ValueError(f"Expected (H, W, 4) array, got {arr.shape}")
+    h, w, _ = arr.shape
+    arr_c = np.ascontiguousarray(arr, dtype=np.float32)
+    if passes <= 0:
+        return arr_c.copy()
+    if _LIB is not None:
+        out = np.empty((h, w, 4), dtype=np.float32)
+        rc = _LIB.gaussian5_hw4_f32(_ptr_f32(arr_c), _ptr_f32(out), h, w, int(passes))
+        if rc == 0:
+            return out
+
+    cur = arr_c
+    scale = np.float32(1.0 / 16.0)
+    for _ in range(passes):
+        px = np.pad(cur, ((0, 0), (2, 2), (0, 0)), mode="edge")
+        cur = (
+            px[:, :-4]
+            + np.float32(4.0) * px[:, 1:-3]
+            + np.float32(6.0) * px[:, 2:-2]
+            + np.float32(4.0) * px[:, 3:-1]
+            + px[:, 4:]
+        ) * scale
+        py = np.pad(cur, ((2, 2), (0, 0), (0, 0)), mode="edge")
+        cur = (
+            py[:-4, :]
+            + np.float32(4.0) * py[1:-3, :]
+            + np.float32(6.0) * py[2:-2, :]
+            + np.float32(4.0) * py[3:-1, :]
+            + py[4:, :]
+        ) * scale
+    return cur
+
+
+def downsample2x_hw4(arr: np.ndarray) -> np.ndarray:
+    """Downsample (H, W, 4) float32 to (ceil(H/2), ceil(W/2), 4) with edge clamping."""
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise ValueError(f"Expected (H, W, 4) array, got {arr.shape}")
+    h, w, _ = arr.shape
+    out_h, out_w = (h + 1) // 2, (w + 1) // 2
+    arr_c = np.ascontiguousarray(arr, dtype=np.float32)
+    if _LIB is not None:
+        out = np.empty((out_h, out_w, 4), dtype=np.float32)
+        _LIB.downsample2x_hw4_f32(_ptr_f32(arr_c), _ptr_f32(out), h, w)
+        return out
+
+    pad_h = h & 1
+    pad_w = w & 1
+    if pad_h or pad_w:
+        arr_c = np.pad(arr_c, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    return np.float32(0.25) * (arr_c[0::2, 0::2] + arr_c[0::2, 1::2] + arr_c[1::2, 0::2] + arr_c[1::2, 1::2])
+
+
+def box_filter_2d(arr: np.ndarray, radius: int) -> np.ndarray:
+    """Separable O(H*W) box filter on 2D float32 array with edge clamping."""
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D array, got {arr.shape}")
+    h, w = arr.shape
+    arr_c = np.ascontiguousarray(arr, dtype=np.float32)
+    rad = int(radius)
+    if rad <= 0:
+        return arr_c.copy()
+    if _LIB is not None:
+        out = np.empty((h, w), dtype=np.float32)
+        rc = _LIB.box_filter_2d_f32(_ptr_f32(arr_c), _ptr_f32(out), h, w, rad)
+        if rc == 0:
+            return out
+
+    win = float(2 * rad + 1)
+    px = np.pad(arr_c, ((0, 0), (rad, rad)), mode="edge")
+    cs_x = np.empty((h, w + 2 * rad + 1), dtype=np.float32)
+    cs_x[:, 0] = 0.0
+    np.cumsum(px, axis=1, dtype=np.float32, out=cs_x[:, 1:])
+    blur_x = (cs_x[:, 2 * rad + 1 :] - cs_x[:, :w]) / np.float32(win)
+
+    py = np.pad(blur_x, ((rad, rad), (0, 0)), mode="edge")
+    cs_y = np.empty((h + 2 * rad + 1, w), dtype=np.float32)
+    cs_y[0, :] = 0.0
+    np.cumsum(py, axis=0, dtype=np.float32, out=cs_y[1:, :])
+    return (cs_y[2 * rad + 1 :, :] - cs_y[:h, :]) / np.float32(win)
+
+
+_LUMA_FMT_CODES = {
+    "RGB3": 0,
+    "BGR3": 1,
+    "YUYV": 2,
+    "UYVY": 3,
+}
+
+
+def extract_luma_and_downsample(
+    frame: np.ndarray,
+    pixel_format: str,
+    out_h: int,
+    out_w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract normalized [0, 1] luma_full (H, W) and bilinear-downsampled luma_low (out_h, out_w)."""
+    fmt = pixel_format.upper()
+    if fmt not in _LUMA_FMT_CODES:
+        raise ValueError(f"Unsupported pixel format {pixel_format!r}")
+    fmt_code = _LUMA_FMT_CODES[fmt]
+    if fmt_code >= 2:
+        if frame.ndim != 3 or frame.shape[2] != 4:
+            raise ValueError(f"Expected packed {fmt} pairs, got {frame.shape}")
+        in_h, pair_w, _ = frame.shape
+        in_w = pair_w * 2
+    else:
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"Expected {fmt} frame shaped (H, W, 3), got {frame.shape}")
+        in_h, in_w, _ = frame.shape
+
+    frame_c = np.ascontiguousarray(frame, dtype=np.uint8)
+    if _LIB is not None:
+        luma_full = np.empty((in_h, in_w), dtype=np.float32)
+        luma_low = np.empty((out_h, out_w), dtype=np.float32)
+        rc = _LIB.extract_luma_and_downsample_f32(
+            _ptr_u8(frame_c),
+            fmt_code,
+            in_h,
+            in_w,
+            out_h,
+            out_w,
+            _ptr_f32(luma_full),
+            _ptr_f32(luma_low),
+        )
+        if rc == 0:
+            return luma_full, luma_low
+
+    if fmt == "YUYV":
+        y = np.empty((in_h, in_w), dtype=np.float32)
+        y[:, 0::2] = frame_c[:, :, 0]
+        y[:, 1::2] = frame_c[:, :, 2]
+        luma_full = (y * np.float32(1.0 / 255.0)).astype(np.float32, copy=False)
+    elif fmt == "UYVY":
+        y = np.empty((in_h, in_w), dtype=np.float32)
+        y[:, 0::2] = frame_c[:, :, 1]
+        y[:, 1::2] = frame_c[:, :, 3]
+        luma_full = (y * np.float32(1.0 / 255.0)).astype(np.float32, copy=False)
+    elif fmt == "BGR3":
+        luma_full = (
+            frame_c[:, :, 0] * np.float32(0.114 / 255.0)
+            + frame_c[:, :, 1] * np.float32(0.587 / 255.0)
+            + frame_c[:, :, 2] * np.float32(0.299 / 255.0)
+        ).astype(np.float32, copy=False)
+    else:
+        luma_full = (
+            frame_c[:, :, 0] * np.float32(0.299 / 255.0)
+            + frame_c[:, :, 1] * np.float32(0.587 / 255.0)
+            + frame_c[:, :, 2] * np.float32(0.114 / 255.0)
+        ).astype(np.float32, copy=False)
+
+    luma_low = bilinear_resize_nchw(luma_full[None, None, :, :], out_h, out_w, align_corners=False)[0, 0]
+    return luma_full, luma_low
+
+
+def guided_upsample_coc(
+    luma_full: np.ndarray,
+    luma_low: np.ndarray,
+    coc_low: np.ndarray,
+    radius: int,
+    eps: float,
+) -> np.ndarray:
+    """Guided filter CoC refinement on (S, S) with fused full-res bilinear upsample and clip."""
+    if luma_full.ndim != 2 or luma_low.ndim != 2 or coc_low.ndim != 2:
+        raise ValueError("Expected 2D arrays for guided_upsample_coc")
+    if luma_low.shape != coc_low.shape:
+        raise ValueError(f"luma_low {luma_low.shape} != coc_low {coc_low.shape}")
+    full_h, full_w = luma_full.shape
+    low_h, low_w = luma_low.shape
+
+    lf_c = np.ascontiguousarray(luma_full, dtype=np.float32)
+    ll_c = np.ascontiguousarray(luma_low, dtype=np.float32)
+    cl_c = np.ascontiguousarray(coc_low, dtype=np.float32)
+
+    if _LIB is not None:
+        coc_full = np.empty((full_h, full_w), dtype=np.float32)
+        rc = _LIB.guided_upsample_coc_f32(
+            _ptr_f32(lf_c),
+            _ptr_f32(ll_c),
+            _ptr_f32(cl_c),
+            _ptr_f32(coc_full),
+            full_h,
+            full_w,
+            low_h,
+            low_w,
+            int(radius),
+            float(eps),
+        )
+        if rc == 0:
+            return coc_full
+
+    eps_f = np.float32(eps)
+    mean_i = box_filter_2d(ll_c, radius)
+    mean_p = box_filter_2d(cl_c, radius)
+    corr_i = box_filter_2d(ll_c * ll_c, radius)
+    corr_ip = box_filter_2d(ll_c * cl_c, radius)
+    var_i = np.maximum(corr_i - mean_i * mean_i, np.float32(0.0))
+    cov_ip = corr_ip - mean_i * mean_p
+    a_low = cov_ip / (var_i + eps_f)
+    b_low = mean_p - a_low * mean_i
+    mean_a = bilinear_resize_nchw(box_filter_2d(a_low, radius)[None, None, :, :], full_h, full_w, align_corners=False)[0, 0]
+    mean_b = bilinear_resize_nchw(box_filter_2d(b_low, radius)[None, None, :, :], full_h, full_w, align_corners=False)[0, 0]
+    return np.clip(mean_a * lf_c + mean_b, np.float32(0.0), np.float32(1.0)).astype(np.float32, copy=False)
+
+
+def preprocess_rgb_u8_to_nchw(
+    rgb_u8: np.ndarray,
+    out_h: int,
+    out_w: int | None = None,
+) -> np.ndarray:
+    """Fused uint8 (H, W, 3) -> bilinear resize (align_corners=False) + ImageNet normalize to (1, 3, out_h, out_w)."""
+    if out_w is None:
+        out_w = out_h
+    if rgb_u8.ndim != 3 or rgb_u8.shape[2] != 3:
+        raise ValueError(f"Expected (H, W, 3) RGB array, got {rgb_u8.shape}")
+    in_h, in_w, _ = rgb_u8.shape
+    rgb_c = np.ascontiguousarray(rgb_u8, dtype=np.uint8)
+    out = np.empty((1, 3, out_h, out_w), dtype=np.float32)
+
+    if _LIB is not None:
+        rc = _LIB.preprocess_rgb_u8_to_nchw_f32(
+            _ptr_u8(rgb_c),
+            _ptr_f32(out),
+            in_h,
+            in_w,
+            out_h,
+            out_w,
+        )
+        if rc == 0:
+            return out
+
+    x = (rgb_c.astype(np.float32) * np.float32(1.0 / 255.0)).transpose(2, 0, 1)[None, :, :, :]
+    if in_h != out_h or in_w != out_w:
+        x = bilinear_resize_nchw(x, out_h, out_w, align_corners=False)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+    return ((x - mean) / std).astype(np.float32, copy=False)
+
+
+def fused_mha_qkv(
+    qkv: np.ndarray,
+    n_heads: int,
+    head_dim: int,
+    scale: float,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    """Fused multi-head self-attention directly from packed (n_tok, 3 * D) QKV float32 tensor."""
+    if qkv.ndim != 2:
+        raise ValueError(f"Expected 2D (n_tok, 3*D) array, got {qkv.shape}")
+    n_tok, three_d = qkv.shape
+    d_total = n_heads * head_dim
+    if three_d != 3 * d_total:
+        raise ValueError(f"Expected 3*D={3 * d_total} columns, got {three_d}")
+
+    qkv_c = np.ascontiguousarray(qkv, dtype=np.float32)
+    if out is None:
+        out = np.empty((n_tok, d_total), dtype=np.float32)
+    else:
+        if out.shape != (n_tok, d_total) or out.dtype != np.float32 or not out.flags["C_CONTIGUOUS"]:
+            raise ValueError(f"out must be C-contiguous float32 with shape {(n_tok, d_total)}")
+
+    if _LIB is not None:
+        rc = _LIB.fused_mha_qkv_f32(
+            _ptr_f32(qkv_c),
+            _ptr_f32(out),
+            n_tok,
+            n_heads,
+            head_dim,
+            float(scale),
+        )
+        if rc == 0:
+            return out
+
+    qkv_h = qkv_c.reshape(n_tok, 3, n_heads, head_dim)
+    q = qkv_h[:, 0].transpose(1, 0, 2)
+    k = qkv_h[:, 1].transpose(1, 2, 0)
+    v = qkv_h[:, 2].transpose(1, 0, 2)
+    attn = softmax_rows(np.matmul(q, k) * np.float32(scale))
+    res = np.matmul(attn, v).transpose(1, 0, 2).reshape(n_tok, d_total)
+    np.copyto(out, res)
+    return out
+
+
+def pack_bokeh_npu_inputs_soa32(
+    l0: np.ndarray,
+    coc_u8: np.ndarray,
+    l1: np.ndarray,
+    l2: np.ndarray,
+    l3: np.ndarray,
+    dst_a: np.ndarray,
+    dst_b: np.ndarray,
+    padded_pixels: int,
+) -> None:
+    """Pack uint8 bokeh pyramid inputs into SoA-32 blocks for vectorized AIE2 NPU execution."""
+    num_pixels = int(coc_u8.size)
+    if _LIB is not None:
+        l0_c = np.ascontiguousarray(l0, dtype=np.uint8)
+        coc_c = np.ascontiguousarray(coc_u8, dtype=np.uint8)
+        l1_c = np.ascontiguousarray(l1, dtype=np.uint8)
+        l2_c = np.ascontiguousarray(l2, dtype=np.uint8)
+        l3_c = np.ascontiguousarray(l3, dtype=np.uint8)
+        rc = _LIB.pack_bokeh_npu_inputs_soa32_u8(
+            _ptr_u8(l0_c),
+            _ptr_u8(coc_c),
+            _ptr_u8(l1_c),
+            _ptr_u8(l2_c),
+            _ptr_u8(l3_c),
+            _ptr_u8(dst_a),
+            _ptr_u8(dst_b),
+            num_pixels,
+            int(padded_pixels),
+        )
+        if rc == 0:
+            return
+
+    chunks = padded_pixels // 32
+    va = dst_a.reshape(chunks, 4, 32)
+    vb = dst_b.reshape(chunks, 9, 32)
+    full = num_pixels // 32
+    n_full = full * 32
+    if full > 0:
+        f0 = l0.reshape(num_pixels, 3)[:n_full].reshape(full, 32, 3).transpose(0, 2, 1)
+        f1 = l1.reshape(num_pixels, 3)[:n_full].reshape(full, 32, 3).transpose(0, 2, 1)
+        f2 = l2.reshape(num_pixels, 3)[:n_full].reshape(full, 32, 3).transpose(0, 2, 1)
+        f3 = l3.reshape(num_pixels, 3)[:n_full].reshape(full, 32, 3).transpose(0, 2, 1)
+        va[:full, :3, :] = f0
+        va[:full, 3, :] = coc_u8.reshape(num_pixels)[:n_full].reshape(full, 32)
+        vb[:full, 0:3, :] = f1
+        vb[:full, 3:6, :] = f2
+        vb[:full, 6:9, :] = f3
+    if padded_pixels > n_full:
+        va[full:] = 0
+        vb[full:] = 0
+        rem = num_pixels - n_full
+        if rem > 0:
+            va[full, :3, :rem] = l0.reshape(num_pixels, 3)[n_full:].T
+            va[full, 3, :rem] = coc_u8.reshape(num_pixels)[n_full:]
+            vb[full, 0:3, :rem] = l1.reshape(num_pixels, 3)[n_full:].T
+            vb[full, 3:6, :rem] = l2.reshape(num_pixels, 3)[n_full:].T
+            vb[full, 6:9, :rem] = l3.reshape(num_pixels, 3)[n_full:].T
+
+
+def unpremul_resize_hw4_to_rgb_u8(src_hw4: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Unpremultiply (H, W, 4) [R*w, G*w, B*w, w] and bilinearly resize to uint8 (out_h, out_w, 3)."""
+    in_h, in_w, c = src_hw4.shape
+    if c != 4:
+        raise ValueError(f"Expected (H, W, 4) array, got {src_hw4.shape}")
+    src_c = np.ascontiguousarray(src_hw4, dtype=np.float32)
+    out = np.empty((out_h, out_w, 3), dtype=np.uint8)
+    if _LIB is not None:
+        rc = _LIB.unpremul_resize_hw4_to_rgb_u8_f32(_ptr_f32(src_c), _ptr_u8(out), in_h, in_w, out_h, out_w)
+        if rc == 0:
+            return out
+
+    rgb_f32 = src_c[:, :, :3] / np.maximum(src_c[:, :, 3:4], np.float32(1e-5))
+    arr_nchw = np.ascontiguousarray(rgb_f32.transpose(2, 0, 1))[None, :, :, :]
+    resized = bilinear_resize_nchw(arr_nchw, out_h, out_w, align_corners=False)[0].transpose(1, 2, 0)
+    return np.clip(np.round(resized), 0.0, 255.0).astype(np.uint8)

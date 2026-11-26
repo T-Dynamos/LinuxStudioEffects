@@ -30,35 +30,11 @@ _QUALITY_PRESETS: dict[str, dict[str, object]] = {
 
 
 def _downsample2x_hw4(arr: np.ndarray) -> np.ndarray:
-    h, w, _ = arr.shape
-    pad_h = h & 1
-    pad_w = w & 1
-    if pad_h or pad_w:
-        arr = np.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
-    return np.float32(0.25) * (arr[0::2, 0::2] + arr[0::2, 1::2] + arr[1::2, 0::2] + arr[1::2, 1::2])
+    return vda_host_ops.downsample2x_hw4(arr)
 
 
 def _gaussian5_hw4(arr: np.ndarray, passes: int = 1) -> np.ndarray:
-    cur = arr
-    scale = np.float32(1.0 / 16.0)
-    for _ in range(passes):
-        px = np.pad(cur, ((0, 0), (2, 2), (0, 0)), mode="edge")
-        cur = (
-            px[:, :-4]
-            + np.float32(4.0) * px[:, 1:-3]
-            + np.float32(6.0) * px[:, 2:-2]
-            + np.float32(4.0) * px[:, 3:-1]
-            + px[:, 4:]
-        ) * scale
-        py = np.pad(cur, ((2, 2), (0, 0), (0, 0)), mode="edge")
-        cur = (
-            py[:-4, :]
-            + np.float32(4.0) * py[1:-3, :]
-            + np.float32(6.0) * py[2:-2, :]
-            + np.float32(4.0) * py[3:-1, :]
-            + py[4:, :]
-        ) * scale
-    return cur
+    return vda_host_ops.gaussian5_hw4(arr, passes=passes)
 
 
 def _load_image_rgb(source: str | Path | np.ndarray) -> np.ndarray:
@@ -134,6 +110,8 @@ class BackgroundSegmentationEffect(FrameEffect):
         self._color_channels_cache: dict[tuple[int, int, str, tuple[int, int, int]], np.ndarray] = {}
         self._prev_alpha_low: np.ndarray | None = None
         self._prev_luma_low: np.ndarray | None = None
+        self._cached_alpha_key: tuple[object, ...] | None = None
+        self._cached_alpha_full: np.ndarray | None = None
         self._frame_shape: tuple[int, int] | None = None
 
         self.set_params(
@@ -229,6 +207,8 @@ class BackgroundSegmentationEffect(FrameEffect):
         self._worker.stop()
         self._prev_alpha_low = None
         self._prev_luma_low = None
+        self._cached_alpha_key = None
+        self._cached_alpha_full = None
         self.last_alpha = None
         if self._model is None:
             if self._explicit_weights is not None:
@@ -244,16 +224,28 @@ class BackgroundSegmentationEffect(FrameEffect):
     def matte_updates(self) -> int:
         return self._worker.updates
 
+    @property
+    def matte_lag_frames(self) -> int:
+        return self._worker.lag_frames
+
+    @property
+    def matte_lag_ms(self) -> float:
+        return self._worker.lag_ms
+
     def _refine_alpha(self, alpha_raw: np.ndarray, l0_ch: np.ndarray, pixel_format: str) -> np.ndarray:
         ah, aw = alpha_raw.shape
         h, w, _ = l0_ch.shape
+        cache_key = (id(alpha_raw), ah, aw, h, w, self.temporal_alpha, self.matte_threshold, self.alpha_gamma)
+        if self._cached_alpha_full is not None and self._cached_alpha_key == cache_key:
+            return self._cached_alpha_full
 
         # Compute low-res luma for motion-aware EMA flicker suppression
-        if is_yuv422(pixel_format) or pixel_format.upper() == "RGB3":
-            y_full = l0_ch[:, :, 0].astype(np.float32) * np.float32(1.0 / 255.0)
-        else:
-            y_full = l0_ch[:, :, 2].astype(np.float32) * np.float32(1.0 / 255.0)
-        y_low = vda_host_ops.bilinear_resize_nchw(y_full[None, None, :, :], ah, aw, align_corners=False)[0, 0]
+        _, y_low = vda_host_ops.extract_luma_and_downsample(
+            l0_ch if not is_yuv422(pixel_format) else l0_ch[:, :, 0:1].repeat(3, axis=2),
+            "RGB3" if is_yuv422(pixel_format) else pixel_format,
+            ah,
+            aw,
+        )
 
         if self._prev_luma_low is not None and self._prev_alpha_low is not None and self._prev_alpha_low.shape == alpha_raw.shape:
             diff = np.abs(y_low - self._prev_luma_low)
@@ -272,26 +264,29 @@ class BackgroundSegmentationEffect(FrameEffect):
             alpha_low = np.power(alpha_low, np.float32(self.alpha_gamma))
 
         if ah == h and aw == w:
-            return np.ascontiguousarray(alpha_low, dtype=np.float32)
-        alpha_full = vda_host_ops.bilinear_resize_nchw(alpha_low[None, None, :, :], h, w, align_corners=False)[0, 0]
-        return np.clip(alpha_full, 0.0, 1.0)
+            out = np.ascontiguousarray(alpha_low, dtype=np.float32)
+        else:
+            alpha_full = vda_host_ops.bilinear_resize_nchw(alpha_low[None, None, :, :], h, w, align_corners=False)[0, 0]
+            out = np.clip(alpha_full, 0.0, 1.0)
+        self._cached_alpha_key = cache_key
+        self._cached_alpha_full = out
+        return out
 
     def _build_blurred_bg(self, l0: np.ndarray, alpha_full: np.ndarray) -> np.ndarray:
         h, w, _ = l0.shape
         p1, p2, p3 = self.blur_passes
         bg_weight = np.clip((np.float32(1.0) - alpha_full) * np.float32(1.0 - 1e-3) + np.float32(1e-3), 1e-3, 1.0)
 
-        s1 = _gaussian5_hw4(vda_host_ops.downsample2x_bg_hw4(l0, bg_weight), passes=p1)
-        s2 = _gaussian5_hw4(_downsample2x_hw4(s1), passes=p2)
-        s3 = _gaussian5_hw4(_downsample2x_hw4(_downsample2x_hw4(s2)), passes=p3)
+        s1 = vda_host_ops.gaussian5_hw4(vda_host_ops.downsample2x_bg_hw4(l0, bg_weight), passes=p1)
+        if self.blur_strength < 0.35:
+            return vda_host_ops.unpremul_resize_hw4_to_rgb_u8(s1, h, w)
 
-        if self.blur_strength >= 0.75:
-            bg_small = s3[:, :, :3] / np.maximum(s3[:, :, 3:4], np.float32(1e-5))
-        elif self.blur_strength >= 0.35:
-            bg_small = s2[:, :, :3] / np.maximum(s2[:, :, 3:4], np.float32(1e-5))
-        else:
-            bg_small = s1[:, :, :3] / np.maximum(s1[:, :, 3:4], np.float32(1e-5))
-        return resize_hwc_u8(bg_small, h, w)
+        s2 = vda_host_ops.gaussian5_hw4(vda_host_ops.downsample2x_hw4(s1), passes=p2)
+        if self.blur_strength < 0.75:
+            return vda_host_ops.unpremul_resize_hw4_to_rgb_u8(s2, h, w)
+
+        s3 = vda_host_ops.gaussian5_hw4(vda_host_ops.downsample2x_hw4(vda_host_ops.downsample2x_hw4(s2)), passes=p3)
+        return vda_host_ops.unpremul_resize_hw4_to_rgb_u8(s3, h, w)
 
     def _get_image_bg_channels(self, h: int, w: int, pixel_format: str) -> np.ndarray:
         if self._bg_rgb_raw is None:
@@ -406,6 +401,8 @@ class BackgroundSegmentationEffect(FrameEffect):
         self._worker.stop()
         self._prev_alpha_low = None
         self._prev_luma_low = None
+        self._cached_alpha_key = None
+        self._cached_alpha_full = None
         self.last_alpha = None
         self._bg_channels_cache.clear()
         self._color_channels_cache.clear()

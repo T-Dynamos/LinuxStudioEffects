@@ -167,6 +167,7 @@ class EffectsUnitTests(unittest.TestCase):
 
         from linux_studio_effects.video.effects.automatic_framing.cpu import AutomaticFramingEffect
         from linux_studio_effects.video.effects.portrait_light.cpu import PortraitLightEffect
+        from linux_studio_effects.video.effects.aesthetic_light.cpu import AestheticLightEffect
 
         af = AutomaticFramingEffect(max_size=128, use_real_weights=False)
         af.setup(160, 120, 30.0)
@@ -181,6 +182,13 @@ class EffectsUnitTests(unittest.TestCase):
         self.assertEqual(pl_out.shape, frame.shape)
         self.assertEqual(pl_out.dtype, np.uint8)
         pl.teardown()
+
+        al = AestheticLightEffect(variant="small", input_size=140, use_real_weights=False, async_depth=False)
+        al.setup(160, 120, 30.0)
+        al_out = al.process(frame, FrameContext(1, 0.0, 160, 120, 30.0, pixel_format="RGB3"))
+        self.assertEqual(al_out.shape, frame.shape)
+        self.assertEqual(al_out.dtype, np.uint8)
+        al.teardown()
 
         self.assertIs(PassthroughEffect().process(frame), frame)
         mirrored = MirrorEffect().process(frame)

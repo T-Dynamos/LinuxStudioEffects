@@ -310,6 +310,97 @@ class VideoDepthAnythingUnitTests(unittest.TestCase):
             np.testing.assert_allclose(kb1, kb2, atol=1e-6)
             np.testing.assert_allclose(vb1, vb2, atol=1e-6)
 
+    def test_optimized_bokeh_preprocess_mha_and_ring_kernels(self) -> None:
+        rng = np.random.default_rng(37)
+        h, w, s = 53, 79, 42
+
+        # Phase 1b: gaussian5_hw4, downsample2x_hw4, box_filter_2d, extract_luma, guided_upsample_coc, unpremul_resize
+        hw4 = rng.uniform(0.0, 200.0, size=(h, w, 4)).astype(np.float32)
+        hw4[:, :, 3] = rng.uniform(0.05, 1.0, size=(h, w)).astype(np.float32)
+        g_got = host_ops.gaussian5_hw4(hw4, passes=2)
+        d_got = host_ops.downsample2x_hw4(hw4)
+        b_arr = rng.standard_normal((h, w)).astype(np.float32)
+        b_got = host_ops.box_filter_2d(b_arr, 5)
+        u_got = host_ops.unpremul_resize_hw4_to_rgb_u8(hw4, 120, 160)
+        rgb_odd = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        lf_got, ll_got = host_ops.extract_luma_and_downsample(rgb_odd, "RGB3", s, s)
+        coc_low = rng.random((s, s)).astype(np.float32)
+        coc_got = host_ops.guided_upsample_coc(lf_got, ll_got, coc_low, radius=3, eps=1e-3)
+
+        orig_lib = host_ops._LIB
+        host_ops._LIB = None
+        try:
+            g_ref = host_ops.gaussian5_hw4(hw4, passes=2)
+            d_ref = host_ops.downsample2x_hw4(hw4)
+            b_ref = host_ops.box_filter_2d(b_arr, 5)
+            u_ref = host_ops.unpremul_resize_hw4_to_rgb_u8(hw4, 120, 160)
+            lf_ref, ll_ref = host_ops.extract_luma_and_downsample(rgb_odd, "RGB3", s, s)
+            coc_ref = host_ops.guided_upsample_coc(lf_ref, ll_ref, coc_low, radius=3, eps=1e-3)
+        finally:
+            host_ops._LIB = orig_lib
+
+        np.testing.assert_allclose(g_got, g_ref, atol=1e-4)
+        np.testing.assert_allclose(d_got, d_ref, atol=1e-5)
+        np.testing.assert_allclose(b_got, b_ref, atol=1e-4)
+        self.assertLessEqual(int(np.max(np.abs(u_got.astype(np.int32) - u_ref.astype(np.int32)))), 1)
+        np.testing.assert_allclose(lf_got, lf_ref, atol=1e-6)
+        np.testing.assert_allclose(ll_got, ll_ref, atol=1e-5)
+        np.testing.assert_allclose(coc_got, coc_ref, atol=1e-4)
+
+        # Phase 4/5: preprocess_rgb_u8_to_nchw, fused_mha_qkv, pack_bokeh_npu_inputs_soa32, temporal ring cursor
+        pp_got = host_ops.preprocess_rgb_u8_to_nchw(rgb_odd, s, s)
+        qkv = rng.standard_normal((97, 3 * 6 * 64)).astype(np.float32) * 0.2
+        mha_got = host_ops.fused_mha_qkv(qkv, 6, 64, 1.0 / 8.0)
+
+        npix = 135
+        pad_px = 256
+        l0 = rng.integers(0, 256, size=(npix, 3), dtype=np.uint8)
+        l1 = rng.integers(0, 256, size=(npix, 3), dtype=np.uint8)
+        l2 = rng.integers(0, 256, size=(npix, 3), dtype=np.uint8)
+        l3 = rng.integers(0, 256, size=(npix, 3), dtype=np.uint8)
+        cu8 = rng.integers(0, 256, size=(npix,), dtype=np.uint8)
+        da_got = np.empty((pad_px * 4,), dtype=np.uint8)
+        db_got = np.empty((pad_px * 9,), dtype=np.uint8)
+        host_ops.pack_bokeh_npu_inputs_soa32(l0, cu8, l1, l2, l3, da_got, db_got, pad_px)
+
+        da_ref = np.empty_like(da_got)
+        db_ref = np.empty_like(db_got)
+        orig_lib = host_ops._LIB
+        host_ops._LIB = None
+        try:
+            pp_ref = host_ops.preprocess_rgb_u8_to_nchw(rgb_odd, s, s)
+            mha_ref = host_ops.fused_mha_qkv(qkv, 6, 64, 1.0 / 8.0)
+            host_ops.pack_bokeh_npu_inputs_soa32(l0, cu8, l1, l2, l3, da_ref, db_ref, pad_px)
+        finally:
+            host_ops._LIB = orig_lib
+
+        np.testing.assert_allclose(pp_got, pp_ref, atol=1e-5)
+        np.testing.assert_allclose(mha_got, mha_ref, atol=1e-5)
+        np.testing.assert_array_equal(da_got, da_ref)
+        np.testing.assert_array_equal(db_got, db_ref)
+
+        # Zero-copy temporal ring cursor across 36 frames vs shifting temporal_attn_roll
+        n_heads, dh, d, t_len = 8, 32, 16, 32
+        ch = n_heads * dh
+        k_pe = rng.standard_normal((t_len, ch)).astype(np.float32) * 0.2
+        v_pe = rng.standard_normal((t_len, ch)).astype(np.float32) * 0.2
+        kb_s = np.zeros((d, t_len, ch), dtype=np.float32)
+        vb_s = np.zeros((d, t_len, ch), dtype=np.float32)
+        kb_r = np.zeros((d, t_len, ch), dtype=np.float32)
+        vb_r = np.zeros((d, t_len, ch), dtype=np.float32)
+        scale = float(1.0 / np.sqrt(dh))
+        cursor = 2
+        for step in range(36):
+            q = rng.standard_normal((d, ch)).astype(np.float32)
+            kc = rng.standard_normal((d, ch)).astype(np.float32)
+            vc = rng.standard_normal((d, ch)).astype(np.float32)
+            has_h = step > 0
+            out_s = host_ops.temporal_attn_roll(q, kc, vc, kb_s, vb_s, k_pe, v_pe, n_heads, scale, has_h)
+            out_r = host_ops.temporal_attn_roll_ring(q, kc, vc, kb_r, vb_r, k_pe, v_pe, n_heads, scale, has_h, cursor=cursor)
+            np.testing.assert_allclose(out_r, out_s, atol=1e-5)
+            if has_h:
+                cursor = 2 + ((cursor - 2 + 1) % (t_len - 3))
+
 
 class VideoDepthAnythingNpuTests(unittest.TestCase):
     """Hardware tests verifying NPU1 bf16 MatMul and streaming Video Depth Anything parity."""
@@ -467,6 +558,39 @@ class VideoDepthAnythingNpuTests(unittest.TestCase):
         self.assertEqual(got.shape, ref.shape)
         corr = float(np.corrcoef(got.ravel(), ref.ravel())[0, 1])
         self.assertGreater(corr, 0.9999)
+
+    def test_npu_narrow_n_conv2d_and_unaligned_bokeh_composite(self) -> None:
+        if not probe_npu().available:
+            self.skipTest("No AMD NPU available on this host")
+
+        rng = np.random.default_rng(43)
+        # Exercise narrow-N (c_out=32 < 128) NPU conv2d path.
+        x = rng.standard_normal((1, 64, 48, 48)).astype(np.float32)
+        w4 = (rng.standard_normal((32, 64, 3, 3)) * 0.05).astype(np.float32)
+        bias = (rng.standard_normal((32,)) * 0.1).astype(np.float32)
+        w_ck_cout = np.ascontiguousarray(w4.reshape(32, -1).T)
+        w_kykxc_cout = np.ascontiguousarray(w4.transpose(2, 3, 1, 0).reshape(9 * 64, 32))
+        ref = np.maximum(host_ops.conv2d_3x3_s1_p1(x, w4, bias), 0.0)
+        mm_exec = NpuMatMulExecutor()
+        try:
+            got = mm_exec.conv2d_3x3_s1_p1_nchw(x, w_kykxc_cout, w_ck_cout, bias=bias, apply_relu=True)
+        finally:
+            mm_exec.close()
+        self.assertEqual(got.shape, ref.shape)
+        self.assertGreater(float(np.corrcoef(got.ravel(), ref.ravel())[0, 1]), 0.9999)
+
+        # Exercise NPU bokeh composite + NPU blur at non-multiple-of-128 resolution (odd dims 53x79).
+        cfg = get_video_depth_config("small", input_size=140)
+        weights = create_synthetic_weights(cfg, seed=43)
+        eff = NpuPortraitBlurEffect(variant="small", input_size=140, weights=weights, async_depth=False)
+        frame = rng.integers(0, 256, size=(53, 79, 3), dtype=np.uint8)
+        eff.setup(79, 53, 30.0)
+        try:
+            out = eff.process(frame, FrameContext(1, 0.0, 79, 53, 30.0, pixel_format="RGB3"))
+            self.assertEqual(out.shape, (53, 79, 3))
+            self.assertEqual(out.dtype, np.uint8)
+        finally:
+            eff.teardown()
 
 
 if __name__ == "__main__":

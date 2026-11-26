@@ -30,10 +30,23 @@ model code remains under `video/models/`.
 
 - `portrait_blur`: depth-aware bokeh blur backed by Video Depth Anything (`cpu`, `npu`)
 - `portrait_light`: depth-guided 3D virtual key-light & low-light face exposure balancing (`cpu`, `npu`)
+- `aesthetic_light`: directional warm-white split/side key light with configurable source presets & cool shadow fill (`cpu`, `npu`)
 - `background_segmentation`: MODNet portrait matting for background blur, custom image replacement, solid color, or matte output (`cpu`, `npu`)
 - `automatic_framing`: MODNet-tracked upper-body/face pan, crop, and smooth zoom (`cpu`, `npu`)
 
 For optimization details on the portrait blur / depth inference path, see `OPTIMIZE_BLUR_PLAN.md`.
+
+### Studio TUI (`lse` / `lse-ui` / `python -m linux_studio_effects`)
+
+Launch the interactive Textual TUI (`lse` / `lse-ui` / `python -m linux_studio_effects`) to stream webcam -> `v4l2loopback` (auto-creating/cleaning up `/dev/video4`) or run offline, hot-swapping effects/backends and viewing real-time FPS, video pipeline lag, and async effect lag telemetry:
+
+```bash
+lse
+lse-ui --effect portrait_blur --quality fast
+lse --effect aesthetic_light --light-source right --light-color-preset warm_white --mirror
+lse --effect background_segmentation --bg-mode blur --in-size 1280x720
+python -m linux_studio_effects --effect automatic_framing --quality balanced
+```
 
 `FrameGraph` lets a node consume the camera frame (`input`) or a prior node's
 output, and its selected output is passed to the existing virtual-camera sink:
@@ -118,6 +131,7 @@ python3 tests/test_npu_smoke.py
 - [ ] **Eye Contact (Standard):** Subtle gaze redirection toward the camera
 - [ ] **Eye Contact (Teleprompter):** Continuous gaze correction while reading across the screen
 - [x] **Portrait Light (`portrait_light`):** Depth-guided 3D virtual key-light simulation for low-light face illumination and exposure balancing (`cpu`, `npu`)
+- [x] **Aesthetic Light (`aesthetic_light`):** Cinematic directional warm-white side/split key light with configurable source presets and moody contrast (`cpu`, `npu`)
 - [ ] **Creative Filters:** Stylized real-time filters (*Illustrated*, *Animated*, *Watercolor*)
 
 ### Audio Effects
@@ -127,4 +141,4 @@ python3 tests/test_npu_smoke.py
 - [ ] Virtual webcam output (PipeWire / `v4l2loopback`) compatible with OBS, Zoom, Google Meet, Teams, Discord
 - [ ] Virtual microphone filter node (PipeWire audio filter chain)
 - [ ] Support for both built-in laptop webcams and external USB cameras
-- [ ] Live toggle CLI (`lse-ctl`) and desktop Quick Settings / system tray UI
+- [x] **Studio TUI (`lse` / `lse-ui`):** Interactive Textual studio panel with live camera/virtual-camera streaming, hot-swapped effects, and lag telemetry (`src/linux_studio_effects/tui.py`); desktop Quick Settings / system tray UI still planned

@@ -9,8 +9,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import threading
-import time
 
 import numpy as np
 
@@ -18,10 +16,10 @@ from ...models.video_depth_anything import host_ops as vda_host_ops
 from ...models.video_depth_anything.config import VideoDepthConfig, get_video_depth_config
 from ...models.video_depth_anything.model import InferenceResult, VideoDepthAnythingModel
 from ...models.video_depth_anything.weights import VideoDepthWeights, create_synthetic_weights, load_from_hf
+from ...models.video_depth_anything.worker import AsyncDepthWorker
 from ...pixels import (
     NATIVE_PIXEL_FORMATS,
     is_yuv422,
-    model_luma_input,
     pack_yuv422,
     split_yuv422,
 )
@@ -189,13 +187,7 @@ class PortraitLightEffect(FrameEffect):
         self.local_files_only = local_files_only
         self._explicit_weights = weights
 
-        self._depth_lock = threading.Lock()
-        self._latest_frame: tuple[np.ndarray, str] | None = None
-        self._latest_depth: np.ndarray | None = None
-        self._depth_updates: int = 0
-        self._stop_event = threading.Event()
-        self._frame_ready_event = threading.Event()
-        self._depth_thread: threading.Thread | None = None
+        self._depth_worker = AsyncDepthWorker(depth_interval_s, thread_name="vda-light-worker")
 
         self.set_params(
             light_pos=light_pos,
@@ -292,13 +284,14 @@ class PortraitLightEffect(FrameEffect):
         if "async_depth" in params:
             new_async = bool(params["async_depth"])
             if getattr(self, "async_depth", False) and not new_async:
-                self._stop_depth_worker()
+                self._depth_worker.stop()
             self.async_depth = new_async
         if "depth_interval_s" in params:
             val = float(params["depth_interval_s"])  # type: ignore[arg-type]
             if val < 0.0:
                 raise ValueError(f"depth_interval_s must be >= 0, got {val}")
             self.depth_interval_s = val
+            self._depth_worker.interval_s = val
 
         unknown = set(params) - {
             "light_pos",
@@ -323,7 +316,7 @@ class PortraitLightEffect(FrameEffect):
 
     def setup(self, width: int, height: int, fps: float) -> None:
         super().setup(width, height, fps)
-        self._stop_depth_worker()
+        self._depth_worker.stop()
         self._ema_lo = None
         self._ema_hi = None
         self._prev_depth_norm = None
@@ -350,50 +343,17 @@ class PortraitLightEffect(FrameEffect):
             self._model.reset_temporal_state()
         self._frame_shape = (height, width)
 
-    def _start_depth_worker(self) -> None:
-        if self._depth_thread is not None:
-            return
-        self._stop_event.clear()
-        self._frame_ready_event.clear()
-
-        def _worker() -> None:
-            while not self._stop_event.is_set():
-                if not self._frame_ready_event.wait(timeout=0.05):
-                    continue
-                self._frame_ready_event.clear()
-                with self._depth_lock:
-                    snap = self._latest_frame
-                if snap is None or self._model is None:
-                    continue
-                raw_frame, raw_fmt = snap
-                t0 = time.perf_counter()
-                res = self._model.infer(model_luma_input(raw_frame, raw_fmt))
-                with self._depth_lock:
-                    self._latest_depth = res.depth
-                    self.last_result = res
-                    self._depth_updates += 1
-                rem = self.depth_interval_s - (time.perf_counter() - t0)
-                if rem > 0.0:
-                    self._stop_event.wait(rem)
-
-        self._depth_thread = threading.Thread(target=_worker, daemon=True, name="vda-light-worker")
-        self._depth_thread.start()
-
-    def _stop_depth_worker(self) -> None:
-        self._stop_event.set()
-        self._frame_ready_event.set()
-        if self._depth_thread is not None:
-            self._depth_thread.join(timeout=5.0)
-            self._depth_thread = None
-        with self._depth_lock:
-            self._latest_frame = None
-            self._latest_depth = None
-            self._depth_updates = 0
-
     @property
     def depth_updates(self) -> int:
-        with self._depth_lock:
-            return self._depth_updates
+        return self._depth_worker.updates
+
+    @property
+    def depth_lag_frames(self) -> int:
+        return self._depth_worker.lag_frames
+
+    @property
+    def depth_lag_ms(self) -> float:
+        return self._depth_worker.lag_ms
 
     def compute_light_map(self, depth_raw: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
         """Compute smooth 3D key-light shading map (out_h, out_w) from (S, S) depth."""
@@ -531,30 +491,12 @@ class PortraitLightEffect(FrameEffect):
             self.setup(w, h, ctx.fps if ctx else 30.0)
         assert self._model is not None
 
-        if not self.async_depth:
-            res = self._model.infer(model_luma_input(frame, pixel_format))
-            self.last_result = res
-            self._depth_updates += 1
-            return self.apply_portrait_light(frame, res.depth, pixel_format=pixel_format)
-
-        frame_copy = frame.copy()
-        with self._depth_lock:
-            depth = self._latest_depth
-            self._latest_frame = (frame_copy, pixel_format)
-        if depth is None:
-            res = self._model.infer(model_luma_input(frame_copy, pixel_format))
-            with self._depth_lock:
-                self._latest_depth = res.depth
-                self.last_result = res
-                self._depth_updates += 1
-                depth = res.depth
-            self._start_depth_worker()
-        else:
-            self._frame_ready_event.set()
-        return self.apply_portrait_light(frame, depth, pixel_format=pixel_format)
+        res = self._depth_worker.step(self._model, frame, pixel_format, async_enabled=self.async_depth)
+        self.last_result = res
+        return self.apply_portrait_light(frame, res.depth, pixel_format=pixel_format)
 
     def teardown(self) -> None:
-        self._stop_depth_worker()
+        self._depth_worker.stop()
         self._ema_lo = None
         self._ema_hi = None
         self._prev_depth_norm = None

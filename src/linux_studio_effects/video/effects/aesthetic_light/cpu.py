@@ -52,17 +52,17 @@ class AestheticLightEffect(PortraitLightEffect):
         light_pos: tuple[float, float, float] | None = None,
         light_color: tuple[float, float, float] | None = None,
         shadow_color: tuple[float, float, float] = (0.86, 0.92, 1.02),
-        intensity: float = 2.40,
-        ambient: float = 0.44,
-        bg_dim: float = 0.56,
-        bg_spill: float = 0.22,
-        light_radius: float = 0.82,
-        split_sharpness: float = 1.85,
-        specular_strength: float = 0.28,
-        normal_strength: float = 4.2,
-        normal_smooth_radius: int = 5,
-        depth_focus: float = 0.42,
-        depth_softness: float = 0.22,
+        intensity: float = 2.25,
+        ambient: float = 0.56,
+        bg_dim: float = 0.38,
+        bg_spill: float = 0.14,
+        light_radius: float = 0.78,
+        split_sharpness: float = 1.65,
+        specular_strength: float = 0.22,
+        normal_strength: float = 2.6,
+        normal_smooth_radius: int = 8,
+        depth_focus: float = 0.56,
+        depth_softness: float = 0.14,
         depth_percentiles: tuple[float, float] = (5.0, 95.0),
         temporal_alpha: float = 0.35,
         visualize_light: bool = False,
@@ -131,6 +131,8 @@ class AestheticLightEffect(PortraitLightEffect):
             specular_strength=specular_strength,
             bg_spill=bg_spill,
         )
+        self.source = src_key
+        self.color_preset = col_key
 
     def set_params(self, **params: object) -> AestheticLightEffect:
         """Validate and update live-tunable source side, warm tint, contrast, and light coordinates."""
@@ -206,9 +208,11 @@ class AestheticLightEffect(PortraitLightEffect):
         self._prev_depth_norm = d_norm
 
         d_smooth = _box_filter_2d(d_norm, self.normal_smooth_radius)
+        # Keep the foreground silhouette crisp at the boundary to prevent glowing hair/shoulder halos.
+        d_mask = _box_filter_2d(d_norm, 2)
 
         gy, gx = np.gradient(d_smooth)
-        max_grad = np.float32(3.0 / max(1, d_smooth.shape[0]))
+        max_grad = np.float32(1.5 / max(1, d_smooth.shape[0]))
         gx = np.clip(gx, -max_grad, max_grad)
         gy = np.clip(gy, -max_grad, max_grad)
         scale = np.float32(self.normal_strength * max(1, d_smooth.shape[0]) * 0.06)
@@ -220,8 +224,23 @@ class AestheticLightEffect(PortraitLightEffect):
         ny *= inv_n
         nz *= inv_n
 
+        fg_mask = np.clip(
+            (d_mask - np.float32(self.depth_focus - self.depth_softness)) / np.float32(self.depth_softness * 2.0),
+            0.0,
+            1.0,
+        )
+        fg_mask = fg_mask * fg_mask * (np.float32(3.0) - np.float32(2.0) * fg_mask)
+
         assert self._coord_xy is not None
         xs, ys = self._coord_xy
+        mask_sum = float(fg_mask.sum())
+        if mask_sum > 1e-3:
+            fg_cx = np.float32(float((fg_mask * xs).sum()) / mask_sum)
+            fg_cy = np.float32(float((fg_mask * ys).sum()) / mask_sum)
+        else:
+            fg_cx = np.float32(0.5)
+            fg_cy = np.float32(0.45)
+
         lx, ly, lz = self.light_pos
         dx = np.float32(lx) - xs
         dy = np.float32(ly) - ys
@@ -234,24 +253,26 @@ class AestheticLightEffect(PortraitLightEffect):
         ldz = dz * inv_l
 
         ndotl = np.maximum(nx * ldx + ny * ldy + nz * ldz, np.float32(0.0))
-        # High-contrast split wrap: strong key illumination on the lit cheek, smooth rolloff into shadow.
-        wrap = np.power(np.clip(np.float32(0.75) * ndotl + np.float32(0.25), 0.0, 1.0), np.float32(self.split_sharpness))
+
+        # Half-face split plane centered on subject centroid so one cheek glows while the far cheek fades softly.
+        sx = np.float32(lx - float(fg_cx))
+        sy = np.float32((ly - float(fg_cy)) * 0.55)
+        sn = np.float32(max(float(np.hypot(sx, sy)), 1e-3))
+        ux, uy = sx / sn, sy / sn
+        plane_dot = (xs - fg_cx) * ux + (ys - fg_cy) * uy
+        side_split = np.clip(np.float32(0.52) + plane_dot * np.float32(3.4), 0.0, 1.0)
+
+        directional = np.clip(np.float32(0.55) * ndotl + np.float32(0.45) * side_split, 0.0, 1.0)
+        wrap = np.power(directional, np.float32(self.split_sharpness)) * np.sqrt(np.clip(side_split + np.float32(0.15), 0.0, 1.0))
 
         # Subtle Blinn-Phong cheekbone/bridge specular highlight towards camera view vector (0, 0, 1).
         hz = ldz + np.float32(1.0)
         inv_h = np.float32(1.0) / np.sqrt(ldx * ldx + ldy * ldy + hz * hz + np.float32(1e-6))
         ndoth = np.maximum((nx * ldx + ny * ldy + nz * hz) * inv_h, np.float32(0.0))
-        spec = np.float32(self.specular_strength) * np.power(ndoth, np.float32(8.0))
+        spec = np.float32(self.specular_strength) * np.power(ndoth, np.float32(8.0)) * side_split
 
         rad2 = np.float32(self.light_radius * self.light_radius)
-        falloff = np.float32(1.0) / np.power(np.float32(1.0) + (dx * dx + dy * dy) / rad2, np.float32(1.25))
-
-        fg_mask = np.clip(
-            (d_smooth - np.float32(self.depth_focus - self.depth_softness)) / np.float32(self.depth_softness * 2.0),
-            0.0,
-            1.0,
-        )
-        fg_mask = fg_mask * fg_mask * (np.float32(3.0) - np.float32(2.0) * fg_mask)
+        falloff = np.float32(1.0) / (np.float32(1.0) + (dx * dx + dy * dy) / rad2)
 
         base_low = np.float32(self.ambient) * (np.float32(1.0) - np.float32(self.bg_dim) * (np.float32(1.0) - fg_mask))
         key_scale = np.float32(max(0.0, self.intensity - self.ambient))

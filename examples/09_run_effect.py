@@ -10,11 +10,9 @@ import subprocess
 import sys
 import time
 
-import numpy as np
-
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from linux_studio_effects.video import (
+from linux_studio_effects.video import (  # noqa: E402
     DeviceUnavailableError,
     FrameContext,
     PipelineConfig,
@@ -24,7 +22,9 @@ from linux_studio_effects.video import (
     pick_default_camera,
     query_video_device,
 )
-from linux_studio_effects.video.pixels import NATIVE_PIXEL_FORMATS, is_yuv422
+from linux_studio_effects.video.pixels import NATIVE_PIXEL_FORMATS, is_yuv422  # noqa: E402
+
+import numpy as np  # noqa: E402 - import after package 1-thread BLAS/OMP defaults
 
 
 def _size(value: str) -> tuple[int, int]:

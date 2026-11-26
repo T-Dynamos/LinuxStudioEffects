@@ -1582,61 +1582,163 @@ void f32_transpose_to_bf16_pad(
     }
 }
 
+static inline void bf16_copy_vec(uint16_t *dst, const uint16_t *src, size_t n_u16) {
+    size_t i = 0;
+    for (; i + 32 <= n_u16; i += 32) {
+        _mm512_storeu_si512(dst + i, _mm512_loadu_si512(src + i));
+    }
+    if (i + 16 <= n_u16) {
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm256_loadu_si256((const __m256i *)(src + i)));
+        i += 16;
+    }
+    if (i + 8 <= n_u16) {
+        _mm_storeu_si128((__m128i *)(dst + i), _mm_loadu_si128((const __m128i *)(src + i)));
+        i += 8;
+    }
+    for (; i < n_u16; ++i) {
+        dst[i] = src[i];
+    }
+}
+
+static inline void bf16_zero_vec(uint16_t *dst, size_t n_u16) {
+    const __m512i z512 = _mm512_setzero_si512();
+    const __m256i z256 = _mm256_setzero_si256();
+    const __m128i z128 = _mm_setzero_si128();
+    size_t i = 0;
+    for (; i + 32 <= n_u16; i += 32) {
+        _mm512_storeu_si512(dst + i, z512);
+    }
+    if (i + 16 <= n_u16) {
+        _mm256_storeu_si256((__m256i *)(dst + i), z256);
+        i += 16;
+    }
+    if (i + 8 <= n_u16) {
+        _mm_storeu_si128((__m128i *)(dst + i), z128);
+        i += 8;
+    }
+    for (; i < n_u16; ++i) {
+        dst[i] = 0;
+    }
+}
+
+static void convert_nchw_row_to_hwc_bf16(
+    const float *x_nchw,
+    int64_t hw,
+    int64_t c_in,
+    int64_t w,
+    int64_t sy,
+    uint16_t *dst_row
+) {
+    uint16_t tile[16][16];
+    const size_t row_off = (size_t)sy * (size_t)w;
+    for (int64_t c0 = 0; c0 < c_in; c0 += 16) {
+        const int64_t bc = (c_in - c0 < 16) ? (c_in - c0) : 16;
+        for (int64_t x0 = 0; x0 < w; x0 += 16) {
+            const int64_t bx = (w - x0 < 16) ? (w - x0) : 16;
+            const __mmask16 km = (bx == 16) ? (__mmask16)0xFFFFu : (__mmask16)((1u << bx) - 1u);
+            for (int64_t cc = 0; cc < bc; ++cc) {
+                const float *s = x_nchw + (size_t)(c0 + cc) * (size_t)hw + row_off + x0;
+                __m512 vf = (bx == 16) ? _mm512_loadu_ps(s) : _mm512_maskz_loadu_ps(km, s);
+                __m256bh vb = _mm512_cvtneps_pbh(vf);
+                _mm256_mask_storeu_epi16(tile[cc], km, (__m256i)vb);
+            }
+            for (int64_t xx = 0; xx < bx; ++xx) {
+                uint16_t *d = dst_row + (x0 + xx) * c_in + c0;
+                for (int64_t cc = 0; cc < bc; ++cc) {
+                    d[cc] = tile[cc][xx];
+                }
+            }
+        }
+    }
+}
+
 typedef struct {
-    const uint16_t *hwc;
+    const float *x_nchw;
     uint16_t *dst_mk;
     int64_t dst_stride_elems;
     int64_t c_in;
     int64_t h;
     int64_t w;
+    int64_t hw;
     int64_t k_elems;
-    size_t c_bytes;
-    size_t span3_bytes;
-    size_t k_tail_bytes;
+    int64_t k_tail_elems;
 } im2col_kykxc_bf16_ctx_t;
+
+static __thread uint16_t *g_im2col_ring_buf = NULL;
+static __thread size_t g_im2col_ring_cap = 0;
 
 static void im2col_kykxc_bf16_worker(int64_t y_start, int64_t y_end, void *arg) {
     const im2col_kykxc_bf16_ctx_t *ctx = (const im2col_kykxc_bf16_ctx_t *)arg;
-    const uint16_t *hwc = ctx->hwc;
+    const float *x_nchw = ctx->x_nchw;
     uint16_t *dst_mk = ctx->dst_mk;
     const int64_t dst_stride_elems = ctx->dst_stride_elems;
     const int64_t c_in = ctx->c_in;
     const int64_t h = ctx->h;
     const int64_t w = ctx->w;
+    const int64_t hw = ctx->hw;
     const int64_t k_elems = ctx->k_elems;
-    const size_t c_bytes = ctx->c_bytes;
-    const size_t span3_bytes = ctx->span3_bytes;
-    const size_t k_tail_bytes = ctx->k_tail_bytes;
+    const int64_t k_tail_elems = ctx->k_tail_elems;
+    const size_t row_elems = (size_t)w * (size_t)c_in;
+    const size_t span3_elems = (size_t)(3 * c_in);
+    const size_t need_cap = 3 * row_elems;
+
+    if (need_cap > g_im2col_ring_cap) {
+        uint16_t *nbuf = (uint16_t *)realloc(g_im2col_ring_buf, need_cap * sizeof(uint16_t));
+        if (!nbuf) {
+            return;
+        }
+        g_im2col_ring_buf = nbuf;
+        g_im2col_ring_cap = need_cap;
+    }
+
+    uint16_t *ring[3] = {
+        g_im2col_ring_buf,
+        g_im2col_ring_buf + row_elems,
+        g_im2col_ring_buf + 2 * row_elems,
+    };
+
+    if (y_start - 1 >= 0) {
+        convert_nchw_row_to_hwc_bf16(x_nchw, hw, c_in, w, y_start - 1, ring[(y_start - 1) % 3]);
+    }
+    if (y_start < h) {
+        convert_nchw_row_to_hwc_bf16(x_nchw, hw, c_in, w, y_start, ring[y_start % 3]);
+    }
 
     for (int64_t y = y_start; y < y_end; ++y) {
+        if (y + 1 < h) {
+            convert_nchw_row_to_hwc_bf16(x_nchw, hw, c_in, w, y + 1, ring[(y + 1) % 3]);
+        }
+        const uint16_t *r_top = (y > 0) ? ring[(y - 1) % 3] : NULL;
+        const uint16_t *r_mid = ring[y % 3];
+        const uint16_t *r_bot = (y + 1 < h) ? ring[(y + 1) % 3] : NULL;
+        const uint16_t *src_rows[3] = {r_top, r_mid, r_bot};
+
         for (int64_t x = 0; x < w; ++x) {
             uint16_t *drow = dst_mk + (y * w + x) * dst_stride_elems;
+            const int interior = (x > 0 && x + 1 < w);
             for (int64_t ky = 0; ky < 3; ++ky) {
-                const int64_t sy = y + ky - 1;
-                uint16_t *dk = drow + ky * 3 * c_in;
-                if (sy < 0 || sy >= h) {
-                    memset(dk, 0, span3_bytes);
+                const uint16_t *s_row = src_rows[ky];
+                uint16_t *dk = drow + (size_t)ky * span3_elems;
+                if (!s_row) {
+                    bf16_zero_vec(dk, span3_elems);
+                } else if (interior) {
+                    bf16_copy_vec(dk, s_row + (size_t)(x - 1) * (size_t)c_in, span3_elems);
                 } else {
-                    const uint16_t *s_row = hwc + sy * w * c_in;
-                    if (x > 0 && x + 1 < w) {
-                        memcpy(dk, s_row + (x - 1) * c_in, span3_bytes);
+                    if (x > 0) {
+                        bf16_copy_vec(dk, s_row + (size_t)(x - 1) * (size_t)c_in, (size_t)c_in);
                     } else {
-                        if (x > 0) {
-                            memcpy(dk, s_row + (x - 1) * c_in, c_bytes);
-                        } else {
-                            memset(dk, 0, c_bytes);
-                        }
-                        memcpy(dk + c_in, s_row + x * c_in, c_bytes);
-                        if (x + 1 < w) {
-                            memcpy(dk + 2 * c_in, s_row + (x + 1) * c_in, c_bytes);
-                        } else {
-                            memset(dk + 2 * c_in, 0, c_bytes);
-                        }
+                        bf16_zero_vec(dk, (size_t)c_in);
+                    }
+                    bf16_copy_vec(dk + c_in, s_row + (size_t)x * (size_t)c_in, (size_t)c_in);
+                    if (x + 1 < w) {
+                        bf16_copy_vec(dk + 2 * c_in, s_row + (size_t)(x + 1) * (size_t)c_in, (size_t)c_in);
+                    } else {
+                        bf16_zero_vec(dk + 2 * c_in, (size_t)c_in);
                     }
                 }
             }
-            if (k_tail_bytes) {
-                memset(drow + k_elems, 0, k_tail_bytes);
+            if (k_tail_elems > 0) {
+                bf16_zero_vec(drow + k_elems, (size_t)k_tail_elems);
             }
         }
     }
@@ -1654,33 +1756,23 @@ int im2col_3x3_s1_p1_kykxc_bf16_pad(
     int zero_tail
 ) {
     /*
-     * Converts (1, c_in, h, w) float32 -> temporary (h, w, c_in) bf16, then streams 3x3 s=1 p=1
-     * patches directly into dst_mk[(h*w)_pad, (9*c_in)_pad] with K ordered as (ky, kx, c_in).
+     * Single-pass rolling 3-row L1/L2 cache-hot im2col: converts (1, c_in, h, w) float32
+     * directly into dst_mk[(h*w)_pad, (9*c_in)_pad] bf16 without full-tensor HWC allocation.
      */
     const int64_t hw = h * w;
     const int64_t k_elems = 9 * c_in;
-    uint16_t *hwc = (uint16_t *)malloc((size_t)hw * (size_t)c_in * sizeof(uint16_t));
-    if (!hwc) {
-        return -1;
-    }
-
-    f32_transpose_to_bf16_pad(x_nchw, hw, hwc, c_in, hw, c_in, c_in, hw, 0);
-
-    const size_t c_bytes = (size_t)c_in * sizeof(uint16_t);
-    const size_t span3_bytes = 3 * c_bytes;
-    const size_t k_tail_bytes = (dst_cols > k_elems) ? (size_t)(dst_cols - k_elems) * sizeof(uint16_t) : 0;
+    const int64_t k_tail_elems = (dst_cols > k_elems) ? (dst_cols - k_elems) : 0;
 
     im2col_kykxc_bf16_ctx_t ctx = {
-        .hwc = hwc,
+        .x_nchw = x_nchw,
         .dst_mk = dst_mk,
         .dst_stride_elems = dst_stride_elems,
         .c_in = c_in,
         .h = h,
         .w = w,
+        .hw = hw,
         .k_elems = k_elems,
-        .c_bytes = c_bytes,
-        .span3_bytes = span3_bytes,
-        .k_tail_bytes = k_tail_bytes,
+        .k_tail_elems = k_tail_elems,
     };
     if (h >= 8 && hw * k_elems >= 32768) {
         lse_parallel_for(h, 4, im2col_kykxc_bf16_worker, &ctx);
@@ -1690,19 +1782,17 @@ int im2col_3x3_s1_p1_kykxc_bf16_pad(
 
     if (zero_tail && dst_rows > hw) {
         if (dst_stride_elems == dst_cols) {
-            memset(
+            bf16_zero_vec(
                 dst_mk + hw * dst_stride_elems,
-                0,
-                (size_t)(dst_rows - hw) * (size_t)dst_cols * sizeof(uint16_t)
+                (size_t)(dst_rows - hw) * (size_t)dst_cols
             );
         } else {
             for (int64_t r = hw; r < dst_rows; ++r) {
-                memset(dst_mk + r * dst_stride_elems, 0, (size_t)dst_cols * sizeof(uint16_t));
+                bf16_zero_vec(dst_mk + r * dst_stride_elems, (size_t)dst_cols);
             }
         }
     }
 
-    free(hwc);
     return 0;
 }
 
@@ -2360,6 +2450,9 @@ static void gaussian5_hw4_v_worker(int64_t y_start, int64_t y_end, void *arg) {
     }
 }
 
+static __thread float *g_gaussian5_tmp = NULL;
+static __thread size_t g_gaussian5_tmp_cap = 0;
+
 int gaussian5_hw4_f32(const float *src, float *dst, int h, int w, int passes) {
     if (h <= 0 || w <= 0) {
         return -1;
@@ -2371,10 +2464,15 @@ int gaussian5_hw4_f32(const float *src, float *dst, int h, int w, int passes) {
         }
         return 0;
     }
-    float *tmp = (float *)malloc(total_floats * sizeof(float));
-    if (!tmp) {
-        return -1;
+    if (total_floats > g_gaussian5_tmp_cap) {
+        float *ntmp = (float *)realloc(g_gaussian5_tmp, total_floats * sizeof(float));
+        if (!ntmp) {
+            return -1;
+        }
+        g_gaussian5_tmp = ntmp;
+        g_gaussian5_tmp_cap = total_floats;
     }
+    float *tmp = g_gaussian5_tmp;
 
     const int use_mt = (h >= 16 && (int64_t)h * w >= 8192);
     for (int p = 0; p < passes; ++p) {
@@ -2403,7 +2501,6 @@ int gaussian5_hw4_f32(const float *src, float *dst, int h, int w, int passes) {
         }
     }
 
-    free(tmp);
     return 0;
 }
 

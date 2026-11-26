@@ -152,6 +152,8 @@ class AsyncModnetWorker:
                 self._updates += 1
             self.start(model)
             return res
+        if self._thread is None:
+            self.start(model)
         if should_capture:
             frame_copy = frame.copy()
             with self._lock:

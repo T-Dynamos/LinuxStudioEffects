@@ -44,10 +44,11 @@ class ModnetModel:
 
         self._npu_mm: Any = None
         self._wt_cache: dict[int, np.ndarray] = {}
+        self._w3x3_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         if self.backend == "npu":
             from ..video_depth_anything.npu_ops import NpuMatMulExecutor
 
-            self._npu_mm = NpuMatMulExecutor()
+            self._npu_mm = NpuMatMulExecutor(use_bf16_out=True)
 
     def _wt(self, weight_2d: np.ndarray) -> np.ndarray:
         wid = id(weight_2d)
@@ -57,67 +58,68 @@ class ModnetModel:
             self._wt_cache[wid] = wt
         return wt
 
+    def _w3x3(self, cw: ConvLayerWeights) -> tuple[np.ndarray, np.ndarray]:
+        wid = id(cw.weight_2d)
+        cached = self._w3x3_cache.get(wid)
+        if cached is None:
+            c_out = int(cw.weight_2d.shape[0])
+            c_in = int(cw.weight_2d.shape[1] // 9)
+            w_ck = self._wt(cw.weight_2d)
+            w_kykxc = np.ascontiguousarray(
+                cw.weight_2d.reshape(c_out, c_in, 3, 3).transpose(2, 3, 1, 0).reshape(9 * c_in, c_out),
+                dtype=np.float32,
+            )
+            cached = (w_kykxc, w_ck)
+            self._w3x3_cache[wid] = cached
+        return cached
+
     def _conv(self, x: np.ndarray, cw: ConvLayerWeights) -> np.ndarray:
-        if cw.has_inorm:
-            # High-FLOP IBNorm dense convs (e.g., conv_lr16x 5x5 1280->96) benefit from NPU bf16 GEMM.
-            if (
-                self._npu_mm is not None
-                and cw.weight_2d.shape[0] >= 64
-                and (x.shape[1] * cw.kh * cw.kw * cw.weight_2d.shape[0] * ((x.shape[2] + 2 * cw.padding - cw.kh) // cw.stride + 1) * ((x.shape[3] + 2 * cw.padding - cw.kw) // cw.stride + 1)) >= 600_000_000
-            ):
-                oh = (x.shape[2] + 2 * cw.padding - cw.kh) // cw.stride + 1
-                ow = (x.shape[3] + 2 * cw.padding - cw.kw) // cw.stride + 1
-                cols = x.reshape(x.shape[1], oh * ow) if (cw.kh == 1 and cw.stride == 1 and cw.padding == 0) else host_ops.im2col_kxk_p(x, kh=cw.kh, kw=cw.kw, stride=cw.stride, padding=cw.padding)
-                y = self._npu_mm.matmul(
-                    cols,
-                    self._wt(cw.weight_2d),
-                    bias=cw.bias,
-                    cache_b=True,
-                    transpose_a=True,
-                    out_nchw_hw=(oh, ow),
-                )
-            else:
-                y = host_ops.conv2d_nchw(
+        _, c_in, h, w = x.shape
+        c_out = int(cw.weight_2d.shape[0])
+        oh = (h + 2 * cw.padding - cw.kh) // cw.stride + 1
+        ow = (w + 2 * cw.padding - cw.kw) // cw.stride + 1
+        m = oh * ow
+        flops = c_in * cw.kh * cw.kw * c_out * m * 2
+
+        if self._npu_mm is not None and 32 <= c_out <= 96 and m >= 2048:
+            # Offload compute-heavy 3x3s1p1 decoder/encoder layers in the resident narrow-N XCLBIN
+            # where 1-thread CPU im2col+GEMM is slower than NPU DMA + dispatch.
+            if cw.kh == 3 and cw.kw == 3 and cw.stride == 1 and cw.padding == 1 and c_in >= 32 and flops >= 70_000_000:
+                w_kykxc, w_ck = self._w3x3(cw)
+                use_relu = (cw.relu_mode == "relu") and (not cw.has_inorm)
+                y = self._npu_mm.conv2d_3x3_s1_p1_nchw(
                     x,
-                    cw.weight_2d,
-                    cw.bias,
-                    kh=cw.kh,
-                    kw=cw.kw,
-                    stride=cw.stride,
-                    padding=cw.padding,
-                    relu_mode=None,
+                    w_kykxc,
+                    w_ck,
+                    bias=cw.bias,
+                    apply_relu=use_relu,
                 )
+                if cw.has_inorm:
+                    return host_ops.ibnorm_tail_relu(
+                        y,
+                        eps=self.config.norm_eps,
+                        apply_relu=(cw.relu_mode == "relu"),
+                    )
+                if cw.relu_mode == "relu6":
+                    return np.clip(y, np.float32(0.0), np.float32(6.0))
+                return y
+
+        if cw.has_inorm:
+            y = host_ops.conv2d_nchw(
+                x,
+                cw.weight_2d,
+                cw.bias,
+                kh=cw.kh,
+                kw=cw.kw,
+                stride=cw.stride,
+                padding=cw.padding,
+                relu_mode=None,
+            )
             return host_ops.ibnorm_tail_relu(
                 y,
                 eps=self.config.norm_eps,
                 apply_relu=(cw.relu_mode == "relu"),
             )
-
-        # Offload only large-channel dense 1x1 convolutions on NPU (where C_out >= 128 and M >= 128).
-        if (
-            self._npu_mm is not None
-            and cw.kh == 1
-            and cw.kw == 1
-            and cw.stride == 1
-            and cw.padding == 0
-            and cw.weight_2d.shape[0] >= 128
-            and (x.shape[2] * x.shape[3]) >= 128
-            and (x.shape[1] * x.shape[2] * x.shape[3] * cw.weight_2d.shape[0]) >= 120_000_000
-        ):
-            _, c_in, h, w = x.shape
-            y = self._npu_mm.matmul(
-                x.reshape(c_in, h * w),
-                self._wt(cw.weight_2d),
-                bias=cw.bias,
-                cache_b=True,
-                transpose_a=True,
-                out_nchw_hw=(h, w),
-            )
-            if cw.relu_mode == "relu":
-                return np.maximum(y, np.float32(0.0))
-            if cw.relu_mode == "relu6":
-                return np.clip(y, np.float32(0.0), np.float32(6.0))
-            return y
 
         return host_ops.conv2d_nchw(
             x,
@@ -146,9 +148,8 @@ class ModnetModel:
         """Resize uint8 RGB (H, W, 3) to aspect-preserving multiple-of-32 and normalize to [-1, 1]."""
         h, w, _ = rgb.shape
         th, tw = self.config.resolve_input_hw(h, w)
-        x = ((rgb.astype(np.float32) * np.float32(1.0 / 127.5)) - np.float32(1.0)).transpose(2, 0, 1)[None, :, :, :]
-        if h != th or w != tw:
-            x = host_ops.bilinear_resize_align_false(x, th, tw)
+        small = host_ops.resize_hwc_u8(rgb, th, tw) if (h != th or w != tw) else rgb
+        x = ((small.astype(np.float32) * np.float32(1.0 / 127.5)) - np.float32(1.0)).transpose(2, 0, 1)[None, :, :, :]
         return np.ascontiguousarray(x, dtype=np.float32)
 
     def infer(self, rgb: np.ndarray) -> SegmentationResult:
@@ -225,3 +226,4 @@ class ModnetModel:
             self._npu_mm.close()
             self._npu_mm = None
         self._wt_cache.clear()
+        self._w3x3_cache.clear()

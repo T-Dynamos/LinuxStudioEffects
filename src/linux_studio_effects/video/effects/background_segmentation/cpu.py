@@ -16,7 +16,14 @@ from ...models.modnet import (
     get_modnet_config,
     load_from_hf,
 )
-from ...models.modnet.host_ops import alpha_composite_bg_u8, resize_hwc_u8
+from ...models.modnet.host_ops import (
+    alpha_composite_bg_u8,
+    bilinear_resize_clamp01,
+    downsample2x_bg_hw4_alpha,
+    extract_luma_low,
+    resize_hwc_u8,
+    unpremul_upsample_bg_composite,
+)
 from ...models.video_depth_anything import host_ops as vda_host_ops
 from ...pixels import NATIVE_PIXEL_FORMATS, channels_to_frame, frame_to_channels, is_yuv422
 from ...virtual_cam import encode_rgb_frame, encode_rgb_to_yuyv, resize_rgb
@@ -84,7 +91,7 @@ class BackgroundSegmentationEffect(FrameEffect):
         matte_threshold: tuple[float, float] = (0.0, 1.0),
         temporal_alpha: float = 0.65,
         async_matte: bool = True,
-        matte_interval_s: float = 0.05,
+        matte_interval_s: float = 0.15,
         name: str | None = None,
         device: ComputeDevice | str = ComputeDevice.CPU,
         enabled: bool = True,
@@ -232,20 +239,30 @@ class BackgroundSegmentationEffect(FrameEffect):
     def matte_lag_ms(self) -> float:
         return self._worker.lag_ms
 
-    def _refine_alpha(self, alpha_raw: np.ndarray, l0_ch: np.ndarray, pixel_format: str) -> np.ndarray:
+    def _refine_alpha(self, alpha_raw: np.ndarray, frame_or_l0: np.ndarray, pixel_format: str) -> np.ndarray:
         ah, aw = alpha_raw.shape
-        h, w, _ = l0_ch.shape
+        fmt = pixel_format.upper()
+        is_packed_yuv = is_yuv422(fmt) and frame_or_l0.ndim == 3 and frame_or_l0.shape[2] == 4
+        h = int(frame_or_l0.shape[0])
+        w = int(frame_or_l0.shape[1] * 2) if is_packed_yuv else int(frame_or_l0.shape[1])
         cache_key = (id(alpha_raw), ah, aw, h, w, self.temporal_alpha, self.matte_threshold, self.alpha_gamma)
         if self._cached_alpha_full is not None and self._cached_alpha_key == cache_key:
             return self._cached_alpha_full
 
-        # Compute low-res luma for motion-aware EMA flicker suppression
-        _, y_low = vda_host_ops.extract_luma_and_downsample(
-            l0_ch if not is_yuv422(pixel_format) else l0_ch[:, :, 0:1].repeat(3, axis=2),
-            "RGB3" if is_yuv422(pixel_format) else pixel_format,
-            ah,
-            aw,
-        )
+        # Compute low-res luma directly from native frame (zero full-res unpack) for motion-aware EMA.
+        if is_packed_yuv or not is_yuv422(fmt):
+            y_low = extract_luma_low(frame_or_l0, fmt, ah, aw)
+        else:
+            y_low = None
+        if y_low is None:
+            l0_ch = frame_or_l0 if frame_or_l0.shape[2] == 3 else frame_to_channels(frame_or_l0, fmt)
+            luma_src = l0_ch[:, :, 0:1].repeat(3, axis=2) if is_yuv422(fmt) else l0_ch
+            _, y_low = vda_host_ops.extract_luma_and_downsample(
+                luma_src,
+                "RGB3" if is_yuv422(fmt) else fmt,
+                ah,
+                aw,
+            )
 
         if self._prev_luma_low is not None and self._prev_alpha_low is not None and self._prev_alpha_low.shape == alpha_raw.shape:
             diff = np.abs(y_low - self._prev_luma_low)
@@ -263,30 +280,31 @@ class BackgroundSegmentationEffect(FrameEffect):
         if self.alpha_gamma != 1.0:
             alpha_low = np.power(alpha_low, np.float32(self.alpha_gamma))
 
-        if ah == h and aw == w:
-            out = np.ascontiguousarray(alpha_low, dtype=np.float32)
-        else:
-            alpha_full = vda_host_ops.bilinear_resize_nchw(alpha_low[None, None, :, :], h, w, align_corners=False)[0, 0]
-            out = np.clip(alpha_full, 0.0, 1.0)
+        out = bilinear_resize_clamp01(alpha_low, h, w)
         self._cached_alpha_key = cache_key
         self._cached_alpha_full = out
         return out
 
+    def _build_blur_pyramid_hw4(self, frame: np.ndarray, pixel_format: str, alpha_full: np.ndarray) -> np.ndarray:
+        p1, p2, p3 = self.blur_passes
+        s1_in = downsample2x_bg_hw4_alpha(frame, pixel_format, alpha_full)
+        if s1_in is None:
+            l0 = np.ascontiguousarray(frame_to_channels(frame, pixel_format), dtype=np.uint8)
+            bg_weight = np.clip((np.float32(1.0) - alpha_full) * np.float32(1.0 - 1e-3) + np.float32(1e-3), 1e-3, 1.0)
+            s1_in = vda_host_ops.downsample2x_bg_hw4(l0, bg_weight)
+
+        s1 = _gaussian5_hw4(s1_in, passes=p1)
+        if self.blur_strength < 0.35:
+            return s1
+        s2 = _gaussian5_hw4(_downsample2x_hw4(s1), passes=p2)
+        if self.blur_strength < 0.75:
+            return s2
+        return _gaussian5_hw4(_downsample2x_hw4(_downsample2x_hw4(s2)), passes=p3)
+
     def _build_blurred_bg(self, l0: np.ndarray, alpha_full: np.ndarray) -> np.ndarray:
         h, w, _ = l0.shape
-        p1, p2, p3 = self.blur_passes
-        bg_weight = np.clip((np.float32(1.0) - alpha_full) * np.float32(1.0 - 1e-3) + np.float32(1e-3), 1e-3, 1.0)
-
-        s1 = vda_host_ops.gaussian5_hw4(vda_host_ops.downsample2x_bg_hw4(l0, bg_weight), passes=p1)
-        if self.blur_strength < 0.35:
-            return vda_host_ops.unpremul_resize_hw4_to_rgb_u8(s1, h, w)
-
-        s2 = vda_host_ops.gaussian5_hw4(vda_host_ops.downsample2x_hw4(s1), passes=p2)
-        if self.blur_strength < 0.75:
-            return vda_host_ops.unpremul_resize_hw4_to_rgb_u8(s2, h, w)
-
-        s3 = vda_host_ops.gaussian5_hw4(vda_host_ops.downsample2x_hw4(vda_host_ops.downsample2x_hw4(s2)), passes=p3)
-        return vda_host_ops.unpremul_resize_hw4_to_rgb_u8(s3, h, w)
+        s_top = self._build_blur_pyramid_hw4(l0, "RGB3", alpha_full)
+        return vda_host_ops.unpremul_resize_hw4_to_rgb_u8(s_top, h, w)
 
     def _get_image_bg_channels(self, h: int, w: int, pixel_format: str) -> np.ndarray:
         if self._bg_rgb_raw is None:
@@ -325,31 +343,44 @@ class BackgroundSegmentationEffect(FrameEffect):
         if fmt not in NATIVE_PIXEL_FORMATS:
             raise ValueError(f"Unsupported pixel format {fmt!r}; expected one of {NATIVE_PIXEL_FORMATS}")
 
-        l0 = np.ascontiguousarray(frame_to_channels(frame, fmt), dtype=np.uint8)
-        alpha_full = self._refine_alpha(alpha_raw, l0, fmt)
+        alpha_full = self._refine_alpha(alpha_raw, frame, fmt)
         self.last_alpha = alpha_full
 
         if self.mode == "matte":
             a_u8 = np.clip(np.round(alpha_full * np.float32(255.0)), 0, 255).astype(np.uint8)
             if is_yuv422(fmt):
-                out_ch = np.empty_like(l0)
-                out_ch[:, :, 0] = a_u8
-                out_ch[:, :, 1] = 128
-                out_ch[:, :, 2] = 128
-            else:
-                out_ch = np.repeat(a_u8[:, :, None], 3, axis=2)
-            return channels_to_frame(out_ch, fmt)
+                out_yuv = np.empty_like(frame)
+                if fmt == "UYVY":
+                    out_yuv[:, :, 0] = 128
+                    out_yuv[:, :, 1] = a_u8[:, 0::2]
+                    out_yuv[:, :, 2] = 128
+                    out_yuv[:, :, 3] = a_u8[:, 1::2]
+                else:
+                    out_yuv[:, :, 0] = a_u8[:, 0::2]
+                    out_yuv[:, :, 1] = 128
+                    out_yuv[:, :, 2] = a_u8[:, 1::2]
+                    out_yuv[:, :, 3] = 128
+                return out_yuv
+            return np.repeat(a_u8[:, :, None], 3, axis=2)
 
-        h, w, _ = l0.shape
         if self.mode == "blur":
             if self.blur_strength <= 0.0:
                 return np.ascontiguousarray(frame, dtype=np.uint8)
-            bg_ch = self._build_blurred_bg(l0, alpha_full)
+            s_top = self._build_blur_pyramid_hw4(frame, fmt, alpha_full)
+            fused = unpremul_upsample_bg_composite(frame, fmt, s_top, alpha_full, self.blur_strength)
+            if fused is not None:
+                return fused
+            h, w = alpha_full.shape
+            l0 = np.ascontiguousarray(frame_to_channels(frame, fmt), dtype=np.uint8)
+            bg_ch = vda_host_ops.unpremul_resize_hw4_to_rgb_u8(s_top, h, w)
             blend_alpha = alpha_full
             if self.blur_strength < 1.0:
                 blend_alpha = np.clip(np.float32(1.0) - np.float32(self.blur_strength) * (np.float32(1.0) - alpha_full), 0.0, 1.0)
-            out_ch = alpha_composite_bg_u8(l0, bg_ch, blend_alpha)
-        elif self.mode == "image":
+            return channels_to_frame(alpha_composite_bg_u8(l0, bg_ch, blend_alpha), fmt)
+
+        l0 = np.ascontiguousarray(frame_to_channels(frame, fmt), dtype=np.uint8)
+        h, w, _ = l0.shape
+        if self.mode == "image":
             bg_ch = self._get_image_bg_channels(h, w, fmt)
             out_ch = alpha_composite_bg_u8(l0, bg_ch, alpha_full)
         else:

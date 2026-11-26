@@ -146,6 +146,51 @@ def _load_c_lib() -> ctypes.CDLL | None:
         ctypes.c_int64,
     ]
     lib.alpha_composite_bg_u8.restype = None
+
+    lib.extract_luma_low_f32.argtypes = [
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.extract_luma_low_f32.restype = ctypes.c_int
+
+    lib.bilinear_resize_clamp01_f32.argtypes = [
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.bilinear_resize_clamp01_f32.restype = ctypes.c_int
+
+    lib.downsample2x_bg_hw4_alpha_f32.argtypes = [
+        _C_U8_PTR,
+        ctypes.c_int,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.downsample2x_bg_hw4_alpha_f32.restype = None
+
+    lib.unpremul_upsample_bg_composite_u8.argtypes = [
+        _C_U8_PTR,
+        ctypes.c_int,
+        _C_FLOAT_PTR,
+        _C_FLOAT_PTR,
+        _C_U8_PTR,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+    lib.unpremul_upsample_bg_composite_u8.restype = ctypes.c_int
     return lib
 
 
@@ -331,6 +376,92 @@ def ibnorm_tail_relu(x: np.ndarray, *, eps: float = 1e-5, apply_relu: bool = Tru
 def bilinear_resize_align_false(x: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     """PyTorch F.interpolate(mode='bilinear', align_corners=False) for NCHW float32."""
     return vda_host_ops.bilinear_resize_nchw(x, out_h, out_w, align_corners=False)
+
+
+def _fmt_code(pixel_format: str) -> int:
+    fmt = pixel_format.upper()
+    if fmt == "RGB3":
+        return 0
+    if fmt == "YUYV":
+        return 1
+    if fmt == "UYVY":
+        return 2
+    if fmt == "BGR3":
+        return 3
+    raise ValueError(f"Unsupported pixel format {pixel_format!r}")
+
+
+def extract_luma_low(frame: np.ndarray, pixel_format: str, out_h: int, out_w: int) -> np.ndarray | None:
+    """Extract normalized [0, 1] float32 luma (out_h, out_w) directly from native RGB3/BGR3/YUYV/UYVY."""
+    if _LIB is None:
+        return None
+    f_c = np.ascontiguousarray(frame, dtype=np.uint8)
+    fmt = pixel_format.upper()
+    in_h = int(f_c.shape[0])
+    in_w = int(f_c.shape[1] * 2) if fmt in ("YUYV", "UYVY") else int(f_c.shape[1])
+    out = np.empty((out_h, out_w), dtype=np.float32)
+    rc = _LIB.extract_luma_low_f32(_ptr_u8(f_c), _fmt_code(fmt), in_h, in_w, _ptr_f32(out), int(out_h), int(out_w))
+    return out if rc == 0 else None
+
+
+def bilinear_resize_clamp01(src: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Bilinearly resize (H, W) float32 with align_corners=False and clamp to [0, 1] in one pass."""
+    s_c = np.ascontiguousarray(src, dtype=np.float32)
+    in_h, in_w = s_c.shape
+    if _LIB is not None:
+        out = np.empty((out_h, out_w), dtype=np.float32)
+        rc = _LIB.bilinear_resize_clamp01_f32(_ptr_f32(s_c), _ptr_f32(out), int(in_h), int(in_w), int(out_h), int(out_w))
+        if rc == 0:
+            return out
+    resized = vda_host_ops.bilinear_resize_nchw(s_c[None, None, :, :], out_h, out_w, align_corners=False)[0, 0]
+    return np.clip(resized, 0.0, 1.0)
+
+
+def downsample2x_bg_hw4_alpha(frame: np.ndarray, pixel_format: str, alpha_hw: np.ndarray) -> np.ndarray | None:
+    """Compute weighted 2x background downsample (H//2, W//2, 4) directly from native frame and alpha."""
+    if _LIB is None:
+        return None
+    f_c = np.ascontiguousarray(frame, dtype=np.uint8)
+    a_c = np.ascontiguousarray(alpha_hw, dtype=np.float32)
+    in_h, in_w = a_c.shape
+    out_h = (in_h + 1) >> 1
+    out_w = (in_w + 1) >> 1
+    out = np.empty((out_h, out_w, 4), dtype=np.float32)
+    code = _fmt_code(pixel_format)
+    _LIB.downsample2x_bg_hw4_alpha_f32(_ptr_u8(f_c), 0 if code == 3 else code, _ptr_f32(a_c), _ptr_f32(out), int(in_h), int(in_w))
+    return out
+
+
+def unpremul_upsample_bg_composite(
+    fg_frame: np.ndarray,
+    pixel_format: str,
+    bg_hw4: np.ndarray,
+    alpha_hw: np.ndarray,
+    blur_strength: float,
+) -> np.ndarray | None:
+    """Fused unpremul + upsample + alpha composite directly to native frame format in one pass."""
+    if _LIB is None:
+        return None
+    f_c = np.ascontiguousarray(fg_frame, dtype=np.uint8)
+    bg_c = np.ascontiguousarray(bg_hw4, dtype=np.float32)
+    a_c = np.ascontiguousarray(alpha_hw, dtype=np.float32)
+    out = np.empty_like(f_c)
+    out_h, out_w = a_c.shape
+    bg_h, bg_w, _ = bg_c.shape
+    code = _fmt_code(pixel_format)
+    rc = _LIB.unpremul_upsample_bg_composite_u8(
+        _ptr_u8(f_c),
+        0 if code == 3 else code,
+        _ptr_f32(bg_c),
+        _ptr_f32(a_c),
+        _ptr_u8(out),
+        int(out_h),
+        int(out_w),
+        int(bg_h),
+        int(bg_w),
+        float(blur_strength),
+    )
+    return out if rc == 0 else None
 
 
 def alpha_composite_bg_u8(fg_rgb: np.ndarray, bg_rgb: np.ndarray, alpha_hw: np.ndarray) -> np.ndarray:
